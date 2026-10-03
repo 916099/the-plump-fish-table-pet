@@ -214,6 +214,7 @@ pip install -r requirements.txt
 - `anim/` 没素材时会**自动退回**手绘立绘
 - 视频与立绘共用本体窗口；窗口轮廓随角色和气泡更新，透明空隙可点击穿透，角色可直接点击和拖拽。
 - 按显示器实际像素绘制，适配 125% / 150% 等显示缩放；立绘直接采样原图，避免先缩小再放大的模糊。Windows 本体窗口关闭系统背景、圆角及边框。
+- 动画帧在后台使用 Lanczos 缩放和轻微锐化，保持角色透明轮廓；移动使用 16 毫秒精确定时器，同一帧的图像和轮廓会复用。动画帧率仍受原素材与解码速度限制。
 
 ### 天气 / 定位 / 城市
 
@@ -379,7 +380,7 @@ python tools/preprocess2.py    # 边缘去污 + 预乘 alpha 缩放出各尺寸
 > **需要 Pillow**：这两个脚本用到了 `PIL`（Pillow），已经在 `requirements.txt` 里，
 > 所以 `pip install -r requirements.txt` 会一起装上。
 > 只装 `PySide6` 的话跑这两个脚本会报 `ModuleNotFoundError: No module named 'PIL'` ——
-> 主程序 `桌宠.py` 本身**不依赖** Pillow，只有换形象才需要。
+> 主程序的动画清晰度增强也使用 Pillow；未安装时可以运行，但会使用普通缩放。
 
 > 开源版改动：这两个脚本原来把作者的素材路径**写死**在代码里（`D:\` 盘下的私人文件夹），
 > 现在改成从环境变量 `DAFEIYU_SRC` / `DAFEIYU_OUT` 读，输出默认写到本仓库的 `sprites/`。

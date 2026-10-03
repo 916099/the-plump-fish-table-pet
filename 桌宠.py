@@ -21,6 +21,10 @@ import tempfile
 import threading
 import time
 import winreg
+try:
+    from PIL import Image as PILImage, ImageFilter
+except ImportError:
+    PILImage = ImageFilter = None
 from PySide6.QtCore import QEvent
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -176,6 +180,7 @@ MARGIN = 4
 SIZE_LEVELS = {"小": 0.55, "中": 0.7, "大": 0.9}
 SPEED = 380.0
 TICK = 20
+FRAME_INTERVAL = 16                  # 约 60 Hz；逻辑时间和速度仍以原来的 20 ms 为基准
 
 LINES = [
     "梁白开，更适合国人的大硬鲸模型",
@@ -2143,12 +2148,18 @@ video{position:fixed;left:0;top:0;width:100%;height:100%;object-fit:contain;
       background:transparent;pointer-events:none;}
 </style></head><body><video id="v" playsinline preload="auto"></video><script>
 const v=document.getElementById('v');
+window.__frameSerial=0; window.__lastCaptured=-1;
+if(v.requestVideoFrameCallback){
+  const trackFrame=()=>{window.__frameSerial++;v.requestVideoFrameCallback(trackFrame);};
+  v.requestVideoFrameCallback(trackFrame);
+}
 window.__st={name:"",ended:false,err:"",frameReady:false};
 v.addEventListener('ended',()=>{window.__st.ended=true;});
 v.addEventListener('error',()=>{window.__st.err=String((v.error&&v.error.code)||-1);});
 v.addEventListener('loadstart',()=>{window.__st.frameReady=false;});
 v.addEventListener('loadeddata',()=>{window.__st.frameReady=true;});
 window.playClip=function(name,loop){
+  window.__lastCaptured=-1;
   window.__st={name:name,ended:false,err:"",frameReady:false};
   v.loop=!!loop; v.src=encodeURI(name)+".webm";
   v.play().catch(e=>{window.__st.err=String(e);});
@@ -2281,12 +2292,14 @@ def start_anim_server():
 
 VIDEO_INFO_JS = ("JSON.stringify((function(){var v=document.querySelector('video');"
                  "if(!v) return null;"
-                 "var frame='';if(v.readyState>=2&&v.videoWidth){"
+                 "var frame='';var serial=v.requestVideoFrameCallback?window.__frameSerial:"
+                 "v.getVideoPlaybackQuality().totalVideoFrames;"
+                 "if(v.readyState>=2&&v.videoWidth&&serial!==window.__lastCaptured){"
                  "var c=window.__frameCanvas||(window.__frameCanvas=document.createElement('canvas'));"
                  "if(c.width!==v.videoWidth)c.width=v.videoWidth;"
                  "if(c.height!==v.videoHeight)c.height=v.videoHeight;"
                  "var g=c.getContext('2d');g.clearRect(0,0,c.width,c.height);g.drawImage(v,0,0);"
-                 "frame=c.toDataURL('image/png').split(',')[1];}"
+                 "frame=c.toDataURL('image/png').split(',')[1];window.__lastCaptured=serial;}"
                  "return {w:v.videoWidth,h:v.videoHeight,t:v.currentTime,dur:v.duration||0,"
                  "ended:!!v.ended,err:(window.__st&&window.__st.err)||'',"
                  "name:(window.__st&&window.__st.name)||'',frame:frame,"
@@ -3372,6 +3385,7 @@ class EyeRestOverlay(QWidget):
 
 
 class VideoBody(QWidget):
+    _frame_processed = Signal(object)
     """隐藏的 WebM 解码器：将透明视频帧交给桌宠本体绘制，不显示浏览器窗口。"""
 
     def __init__(self, on_clip_end=None, parent=None):
@@ -3389,6 +3403,12 @@ class VideoBody(QWidget):
         self.frame_ready = False
         self.frame_image = None
         self._poll_pending = False
+        self._decode_pending = False
+        self._decode_generation = 0
+        self._frame_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pet-frame")
+        QApplication.instance().aboutToQuit.connect(
+            lambda: self._frame_executor.shutdown(wait=True, cancel_futures=True))
+        self._frame_processed.connect(self._accept_processed_frame)
         self.clip = ""
         self.loaded_clip = ""
         self.loop = True
@@ -3399,9 +3419,11 @@ class VideoBody(QWidget):
         self.info = {"dur": 0.0, "t": 0.0, "ended": False, "err": "", "w": 0, "h": 0}
         self._last_end = 0.0
         self._last_rect = None
+        self.render_rect = QRectF()
         self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.timeout.connect(self._poll)
-        self._timer.start(40)
+        self._timer.start(FRAME_INTERVAL)
 
     # ---------- 建 ----------
     def ensure(self):
@@ -3521,6 +3543,7 @@ class VideoBody(QWidget):
 
     def _start_clip(self, clip, loop):
         if clip != self.loaded_clip:
+            self._decode_generation += 1
             self.frame_ready = False
             self.frame_image = None
             self._js("playClip(%s,%s)" % (json.dumps(clip, ensure_ascii=False),
@@ -3531,6 +3554,7 @@ class VideoBody(QWidget):
                      % ("true" if loop else "false"))
 
     def stop(self):
+        self._decode_generation += 1
         self.clip = ""
         self.loaded_clip = ""
         self.pending_clip = None
@@ -3570,7 +3594,8 @@ class VideoBody(QWidget):
                     print("重摆视频窗失败:", e)
 
     def _poll(self):
-        if not self.page_loaded or self.view is None or not self.clip or self._poll_pending:
+        if (not self.page_loaded or self.view is None or not self.clip
+                or self._poll_pending or self._decode_pending):
             return
         if isinstance(self.target_pet, QWidget) and not self.target_pet.isVisible():
             return
@@ -3593,17 +3618,44 @@ class VideoBody(QWidget):
         if frame:
             image = QImage.fromData(base64.b64decode(frame), "PNG")
             if not image.isNull():
-                self.frame_image = image
-                self.frame_ready = True
-            pet = self.target_pet
-            if pet is not None:
-                pet.update()
+                pet = self.target_pet
+                if pet is not None:
+                    self._decode_pending = True
+                    args = (self.clip, self._decode_generation, image,
+                            QRectF(self.render_rect), pet.devicePixelRatioF())
+                    future = self._frame_executor.submit(self._process_frame, *args)
+                    future.add_done_callback(lambda f: self._frame_processed.emit(f.result()))
+                else:
+                    self.frame_image = image
+                    self.frame_ready = True
         if v.get("ended") and not self.loop and self.clip:
             if time.time() - self._last_end > 0.8:
                 self._last_end = time.time()
                 clip = self.clip
                 if self.on_clip_end:
                     self.on_clip_end(clip)
+
+    @staticmethod
+    def _process_frame(clip, generation, image, rect, dpr):
+        try:
+            enhanced, bounds = PetWindow._build_quality_frame(image, rect, dpr)
+        except Exception:
+            enhanced, bounds = image, (0, 0, image.width(), image.height())
+        return clip, generation, image, rect, dpr, enhanced, bounds
+
+    def _accept_processed_frame(self, result):
+        self._decode_pending = False
+        clip, generation, image, rect, dpr, enhanced, bounds = result
+        if clip != self.clip or generation != self._decode_generation:
+            return
+        self.frame_image = image
+        self.frame_ready = True
+        pet = self.target_pet
+        if pet is not None:
+            pet._quality_frame_key = (image.cacheKey(), rect.width(), rect.height(), dpr)
+            pet._quality_frame = enhanced
+            pet._quality_bounds = bounds
+            pet.update()
 
     def set_mirror(self, on):
         on = bool(on)
@@ -3628,10 +3680,15 @@ class VideoBody(QWidget):
         cx_v = (bb["x0"] + bb["x1"]) / 2.0 * vw
         rect = (int(round(cx - cx_v)), int(round(bottom - feet)),
                 int(round(vw)), int(round(vh)))
+        pet = self.target_pet
+        if pet is not None:
+            self.render_rect = QRectF(cx - cx_v - pet.x(), bottom - feet - pet.y(), vw, vh)
         self.set_mirror(mirror)
         if rect != self._last_rect:
             self._last_rect = rect
-            self.setGeometry(*rect)
+            # 隐藏的解码器无需跟着桌宠移动，也无需反复调整网页布局。
+            if self.size().width() != rect[2] or self.size().height() != rect[3]:
+                self.resize(rect[2], rect[3])
 
 class PetWindow(QWidget):
     def locate_me(self, auto=False):
@@ -3865,8 +3922,9 @@ class PetWindow(QWidget):
         self._click_timer.timeout.connect(self._on_single_click)
 
         self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.timeout.connect(self.tick)
-        self.timer.start(TICK)
+        self.timer.start(FRAME_INTERVAL)
 
         self.bubble_font = QFont("Microsoft YaHei UI", 11)
 
@@ -4049,6 +4107,18 @@ class PetWindow(QWidget):
     # ---------- 绘制 ----------
     def paintEvent(self, _):
         dpr = self.devicePixelRatioF()
+        now = self.t * TICK / 1000.0
+        video = self.video
+        cache_key = None
+        if video is not None and video.frame_ready and video.frame_image is not None:
+            r = video.render_rect
+            cache_key = (video.frame_image.cacheKey(), r.x(), r.y(), r.width(), r.height(),
+                         video.mirror, self.width(), self.height(), dpr,
+                         self.bubble_text if now < self.bubble_until else "",
+                         self.bubble_inner, self.bubble_font.toString(), self.cfg.get("theme"))
+            if cache_key == getattr(self, "_video_paint_key", None):
+                self._present_pet_frame(self._video_paint_image, None)
+                return
         image = QImage(round(self.width() * dpr), round(self.height() * dpr),
                        QImage.Format.Format_ARGB32_Premultiplied)
         image.setDevicePixelRatio(dpr)
@@ -4056,7 +4126,6 @@ class PetWindow(QWidget):
         p = QPainter(image)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        now = self.t * TICK / 1000.0
 
         if self.bubble_text and now < self.bubble_until:
             _t = _theme()
@@ -4149,15 +4218,17 @@ class PetWindow(QWidget):
         cur_key = self._sprite_key(act.get("sprite"), act.get("facing"))
         if self.video is not None and self.video.frame_ready and self.video.frame_image is not None:
             # 在本体窗口绘制真实透明视频帧，鼠标直接命中角色，不再叠放浏览器窗口。
-            rect = QRectF(self.video.x() - self.x(), self.video.y() - self.y(),
-                          self.video.width(), self.video.height())
+            rect = QRectF(self.video.render_rect)
+            frame, frame_rect = self._quality_video_frame(rect, dpr)
             p.save()
             if self.video.mirror:
                 p.translate(rect.center().x(), 0)
                 p.scale(-1, 1)
                 p.translate(-rect.center().x(), 0)
-            p.drawImage(rect, self.video.frame_image)
+            p.drawImage(frame_rect, frame)
             p.restore()
+            self._video_paint_key = cache_key
+            self._video_paint_image = image
             self._present_pet_frame(image, p)
             return
         if self.cross_t > 0:
@@ -4165,15 +4236,58 @@ class PetWindow(QWidget):
             draw_one(cur_key, 1.0 - self.cross_t)
         else:
             draw_one(cur_key, 1.0)
+        self._video_paint_key = None
         self._present_pet_frame(image, p)
 
+    def _quality_video_frame(self, rect, dpr):
+        """绘制后台已处理好的帧；显示缩放改变时暂用原帧等待下一帧。"""
+        source = self.video.frame_image
+        key = (source.cacheKey(), rect.width(), rect.height(), dpr)
+        if key != getattr(self, "_quality_frame_key", None):
+            return source, rect
+        x0, y0, x1, y1 = self._quality_bounds
+        crop_rect = QRectF(round((rect.x()+x0*rect.width()/source.width())*dpr)/dpr,
+                          round((rect.y()+y0*rect.height()/source.height())*dpr)/dpr,
+                          self._quality_frame.width()/dpr, self._quality_frame.height()/dpr)
+        return self._quality_frame, crop_rect
+
+    @staticmethod
+    def _build_quality_frame(source, rect, dpr):
+        """后台每帧缩放一次；锐化只改变颜色，保留 Lanczos 缩放后的 alpha。"""
+        default_bounds = (0, 0, source.width(), source.height())
+        if PILImage is None or rect.isEmpty():
+            return source, default_bounds
+        rgba = source.convertToFormat(QImage.Format.Format_RGBA8888)
+        pil = PILImage.frombytes("RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()))
+        # 解码器会在空白画幅留下 alpha=1 的噪点；不让这些噪点扩大缩放范围。
+        bounds = pil.getchannel("A").point(lambda a: 255 if a > 4 else 0).getbbox()
+        if not bounds:
+            return source, default_bounds
+        x0, y0, x1, y1 = bounds
+        bounds = (max(0, x0-2), max(0, y0-2), min(source.width(), x1+2), min(source.height(), y1+2))
+        x0, y0, x1, y1 = bounds
+        size = (max(1, round((x1-x0)*rect.width()/source.width()*dpr)),
+                max(1, round((y1-y0)*rect.height()/source.height()*dpr)))
+        scaled = pil.crop(bounds).resize(size, PILImage.Resampling.LANCZOS)
+        alpha = scaled.getchannel("A")
+        scaled = scaled.convert("RGB").filter(ImageFilter.UnsharpMask(
+            radius=0.55, percent=65, threshold=3)).convert("RGBA")
+        scaled.putalpha(alpha)
+        enhanced = QImage(scaled.tobytes(), size[0], size[1], size[0]*4,
+                          QImage.Format.Format_RGBA8888).copy()
+        return enhanced, bounds
+
     def _present_pet_frame(self, image, painter):
-        painter.end()
+        if painter is not None:
+            painter.end()
         output = QPainter(self)
         # 覆盖旧缓冲区的透明像素，防止轮廓移动后残留半透明底色。
         output.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         output.drawImage(0, 0, image)
         output.end()
+        if image.cacheKey() == getattr(self, "_mask_image_key", None):
+            return
+        self._mask_image_key = image.cacheKey()
         # 窗口区域与实际角色/气泡轮廓一致，透明区域既不显示系统背景也不拦截点击。
         # QWidget 的区域使用逻辑坐标，不能把高 DPI 的物理像素直接交给 setMask。
         mask_image = image.scaled(self.size(), Qt.AspectRatioMode.IgnoreAspectRatio,
@@ -4204,7 +4318,8 @@ class PetWindow(QWidget):
 
     # ---------- 逻辑 ----------
     def tick(self):
-        self.t += 1
+        time_step = FRAME_INTERVAL / TICK
+        self.t += time_step
 
         # 处理后台线程（DeepSeek 等）排队的气泡消息，Qt 界面必须在主线程更新
         if self._say_queue:
@@ -4241,11 +4356,11 @@ class PetWindow(QWidget):
         self._check_shutdown(now_ms)
         
         if self.jump_t > 0:
-            self.jump_t = max(0.0, self.jump_t - 0.06)
+            self.jump_t = max(0.0, self.jump_t - 0.06 * time_step)
         if self.cross_t > 0:
-            self.cross_t = max(0.0, self.cross_t - 0.15)
+            self.cross_t = max(0.0, self.cross_t - 0.15 * time_step)
         if self.action:
-            self.action_left -= 1
+            self.action_left -= time_step
             self.action_t = self._action_progress()
             if self.action_left <= 0:
                 self._finish_action()
@@ -4300,17 +4415,17 @@ class PetWindow(QWidget):
                 self.rest_until = self.t * TICK + random.randint(8000, 18000)
                 self._set_dir("down")
             else:
-                step = self.cur_speed * TICK / 1000.0
+                step = self.cur_speed * FRAME_INTERVAL / 1000.0
                 nx, ny = cx + dx / dist * step, cy + dy / dist * step
                 self.move(int(nx - self.width() / 2), int(ny - self.height() / 2))
                 if abs(dx) > abs(dy) * 1.15:
                     self._set_dir("left" if dx < 0 else "right", 1 if dx < 0 else -1)
                 else:
                     self._set_dir("up" if dy < 0 else "down")
-            if random.random() < 0.002 and self.jump_t == 0:
+            if random.random() < 0.002 * time_step and self.jump_t == 0:
                 self.jump_t = 0.5
         target_speed = SPEED if self.target is not None else 0.0
-        self.cur_speed += (target_speed - self.cur_speed) * 0.3
+        self.cur_speed += (target_speed - self.cur_speed) * (1 - 0.7 ** time_step)
         self.update()
 
     # ---------- 视频动画 ----------
@@ -4408,12 +4523,12 @@ class PetWindow(QWidget):
         if (self.video_ready() and self.video is not None
                 and self.video.bbox is None):
             return                                       # 还没量到角色位置 → 先让待机多播会儿
-        if random.random() < 0.010:                      # 大约每两秒掷一次
+        if random.random() < 0.010 * FRAME_INTERVAL / TICK:
             if self.video_ready():
                 self.play_random_clip()                  # 视频模式：随机抽一个 clip
             else:
                 self.play_action(self._pick_action())
-        if self.t - self.last_speak_tick >= 2400 and random.random() < 0.004:
+        if self.t - self.last_speak_tick >= 2400 and random.random() < 0.004 * FRAME_INTERVAL / TICK:
             self.last_speak_tick = self.t
             if random.random() < 0.75:
                 self.say(random.choice(INNER_LINES), inner=True)
@@ -4500,9 +4615,10 @@ class PetWindow(QWidget):
     def _fly_step(self):
         screen = self.screen() or QApplication.primaryScreen()
         geo = screen.availableGeometry()
-        self.vy += 1.15                                   # 重力
-        nx = self.x() + self.vx
-        ny = self.y() + self.vy
+        time_step = FRAME_INTERVAL / TICK
+        self.vy += 1.15 * time_step                        # 重力
+        nx = self.x() + self.vx * time_step
+        ny = self.y() + self.vy * time_step
         if nx < geo.left():
             nx, self.vx = geo.left(), -self.vx * 0.55
         elif nx + self.width() > geo.right():
@@ -4522,7 +4638,7 @@ class PetWindow(QWidget):
                 self.vy = -self.vy * 0.45                 # 落地弹一下
                 self.vx *= 0.82
                 self._bubble_now("💨", 600)
-        self.vx *= 0.995                                  # 空气阻力
+        self.vx *= 0.995 ** time_step                      # 空气阻力
         self.move(int(nx), int(ny))
         self.cfg["x"], self.cfg["y"] = self.x(), self.y()
         self._sync_video()                                # 飞的时候视频也得跟着
