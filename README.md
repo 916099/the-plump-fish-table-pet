@@ -370,10 +370,16 @@ pyinstaller --noconfirm --onefile --windowed --name 大肥鱼桌宠 --add-data "
 把新的三视图（白底）放到某个目录，然后：
 
 ```bash
+pip install -r requirements.txt   # 已经装过就跳过（这一步会把 Pillow 也装上）
 set DAFEIYU_SRC=D:\你的素材目录
 python tools/preprocess.py     # 白底抠图 + 统一高度
 python tools/preprocess2.py    # 边缘去污 + 预乘 alpha 缩放出各尺寸
 ```
+
+> **需要 Pillow**：这两个脚本用到了 `PIL`（Pillow），已经在 `requirements.txt` 里，
+> 所以 `pip install -r requirements.txt` 会一起装上。
+> 只装 `PySide6` 的话跑这两个脚本会报 `ModuleNotFoundError: No module named 'PIL'` ——
+> 主程序 `桌宠.py` 本身**不依赖** Pillow，只有换形象才需要。
 
 > 开源版改动：这两个脚本原来把作者的素材路径**写死**在代码里（`D:\` 盘下的私人文件夹），
 > 现在改成从环境变量 `DAFEIYU_SRC` / `DAFEIYU_OUT` 读，输出默认写到本仓库的 `sprites/`。

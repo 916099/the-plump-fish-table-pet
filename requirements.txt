@@ -1,4 +1,10 @@
+# 主程序（桌宠.py）需要的
 PySide6>=6.5
 requests
 psutil
 pynvml
+
+# 只有「更换形象」用的素材工具（tools/preprocess.py、tools/preprocess2.py）需要
+# 说明：主程序本身不依赖 Pillow；不加这一行的话，README 里「更换形象」那一步会报
+#       ModuleNotFoundError: No module named 'PIL'
+Pillow

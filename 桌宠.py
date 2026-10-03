@@ -447,6 +447,12 @@ TASK_TOOLS = [
 
 def load_json(path, default):
     if not os.path.exists(path):
+        # ★ 开源版修复（阻断级）：配置目录（%APPDATA%\dafeiyu-pet\）在全新机器上并不存在，
+        #   以前这里直接 open(path,"w") 会抛 FileNotFoundError，
+        #   结果是「全新用户第一次启动桌宠直接起不来」。写之前先把父目录建出来。
+        _d = os.path.dirname(path)
+        if _d:
+            os.makedirs(_d, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(
                 default,
@@ -678,6 +684,14 @@ def bootstrap_config():
                 notes.append("Key 已加密收进 key.bin")
     except Exception as e:
         print("[Key] 明文收编失败（不影响使用）:", e)
+
+    # ★ 兜底：保证配置目录真的存在。
+    #   全新机器上 %APPDATA%\dafeiyu-pet\ 可能刚被算出来但还没建出来，
+    #   后面的 load_json / save_config 都会往这里写。
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+    except Exception as e:
+        print("[配置] 建配置目录失败:", e)
 
     _BOOT_NOTE = "；".join(notes)
     return _BOOT_NOTE
