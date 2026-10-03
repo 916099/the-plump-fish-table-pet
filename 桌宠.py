@@ -4623,14 +4623,22 @@ class PetWindow(QWidget):
         if not self._edge_impact_until or time.monotonic() < self._edge_impact_until:
             return
         self._edge_impact_until = 0.0
+        bump_clip = ACTION_TO_CLIP.get("bump")
+        resume_original_flow = (self.action == "bump" or
+                                (self.video is not None and self.video.clip == bump_clip))
+        if not resume_original_flow:
+            return
         if self.action == "bump":
             self.action = None
             self.action_left = self.action_total = 0
             self.action_t = 0.0
-            self.update()
-        if (self.video is not None and self.video.clip == ACTION_TO_CLIP.get("bump")
+        self.target = None
+        self.rest_until = self.t * TICK
+        self.play_action("squash", force=True)
+        if (self.video is not None and self.video.clip == bump_clip
                 and not self.flying and not self.dragging):
             self._video_idle()
+        self.update()
 
     def _keep_scene_on_screen(self):
         left, top, right, bottom = self._scene_body_limits()
