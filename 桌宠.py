@@ -3831,6 +3831,10 @@ class VideoBody(QWidget):
         vh = max(60.0, sprite_h / ch * ANIMATION_FRAME_SCALE)
         pet = self.target_pet
         if pet is not None:
+            # 拖拽动画切换或跨屏时锁定手势开始时的画幅，避免每次鼠标移动重新缩放。
+            drag_locked = pet.dragging and not self.render_rect.isEmpty()
+            if drag_locked:
+                vh = self.render_rect.height()
             # 缩放依据完整源画幅，不能依据当前帧的道具包围盒，否则角色会忽大忽小。
             geo = pet._scene_screen_rect()
             def canvas_at(height):
@@ -3841,7 +3845,7 @@ class VideoBody(QWidget):
                 return QRectF(0, 0, pet.win_w, pet.win_h).united(
                     scene.adjusted(-2, -2, 2, 2)).toAlignedRect()
             area = canvas_at(vh)
-            if area.width() > geo.width() or area.height() > geo.height():
+            if not drag_locked and (area.width() > geo.width() or area.height() > geo.height()):
                 low, high = 0.0, vh
                 for _ in range(20):
                     mid = (low + high) / 2
