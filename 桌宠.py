@@ -4068,6 +4068,7 @@ class PetWindow(QWidget):
         self.t = 0
         self.jump_t = 0
         self.dragging = False
+        self._drag_content_rect = None
         self.drag_offset = None
         self.drag_start_pos = None
         self.last_line = ""
@@ -4411,6 +4412,13 @@ class PetWindow(QWidget):
             # 在本体窗口绘制真实透明视频帧，鼠标直接命中角色，不再叠放浏览器窗口。
             rect = QRectF(self.video.render_rect)
             frame, frame_rect = self._quality_video_frame(rect, dpr)
+            if self.dragging:
+                if self._drag_content_rect is None:
+                    self._drag_content_rect = QRectF(frame_rect)
+                else:
+                    # 悬空反馈素材会轻微改变角色的画面位置和轮廓尺寸。
+                    # 拖动时把裁出的角色固定在首帧位置和大小，消除“越拖越缩”的错觉。
+                    frame_rect = QRectF(self._drag_content_rect)
             p.save()
             if self.video.mirror:
                 p.translate(rect.center().x(), 0)
@@ -4876,6 +4884,7 @@ class PetWindow(QWidget):
         self.flying = True
         self.target = None
         self.dragging = False
+        self._drag_content_rect = None
         self.drag_offset = None
         self.chat_paused = False
         if random.random() < 0.5:
@@ -5309,6 +5318,7 @@ class PetWindow(QWidget):
             delta = e.globalPosition().toPoint() - self.drag_start_pos
             if not self.dragging and delta.manhattanLength() > 6:
                 self.dragging = True
+                self._drag_content_rect = None
                 self.drag_offset = e.globalPosition().toPoint() - QPoint(self._body_pos().x(), self._body_pos().y())
                 if self.video_ready():
                     self.show_clip(self.clip_for("拖拽"), loop=True)   # 悬空反馈动画
@@ -5326,6 +5336,7 @@ class PetWindow(QWidget):
         if e.button() == Qt.MouseButton.LeftButton:
             if self.dragging:
                 self.dragging = False
+                self._drag_content_rect = None
                 self.drag_offset = None
                 self.drag_start_pos = None
                 self.target = None
