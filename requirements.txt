@@ -6,3 +6,5 @@ pynvml
 
 # 动画的 Lanczos 缩放、轻微锐化，以及「更换形象」的素材工具需要
 Pillow
+# 优先使用后台原生 VP9-alpha 解码，减少高清动画的帧传输开销
+imageio-ffmpeg

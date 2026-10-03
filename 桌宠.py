@@ -25,6 +25,11 @@ try:
     from PIL import Image as PILImage, ImageFilter
 except ImportError:
     PILImage = ImageFilter = None
+try:
+    import imageio_ffmpeg
+    VIDEO_FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+except (ImportError, RuntimeError):
+    VIDEO_FFMPEG = None
 from PySide6.QtCore import QEvent
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -2216,6 +2221,10 @@ class _AnimHandler(SimpleHTTPRequestHandler):
             root = os.path.normpath(ANIM_DIR)
             if not full.startswith(root):
                 return os.path.join(root, "__denied__")      # 防目录穿越
+            # 同名高清素材优先，原 360p 素材继续作为兼容兜底。
+            hd = os.path.normpath(os.path.join(ANIM_DIR, "hd", rel))
+            if full.lower().endswith(".webm") and os.path.isfile(hd):
+                return hd
             return full
         except Exception:
             return os.path.join(ANIM_DIR, "__denied__")
@@ -2292,17 +2301,29 @@ def start_anim_server():
 
 VIDEO_INFO_JS = ("JSON.stringify((function(){var v=document.querySelector('video');"
                  "if(!v) return null;"
-                 "var frame='';var serial=v.requestVideoFrameCallback?window.__frameSerial:"
+                 "var frame='',fx=0,fy=0,fw=0,fh=0;var serial=v.requestVideoFrameCallback?window.__frameSerial:"
                  "v.getVideoPlaybackQuality().totalVideoFrames;"
                  "if(v.readyState>=2&&v.videoWidth&&serial!==window.__lastCaptured){"
                  "var c=window.__frameCanvas||(window.__frameCanvas=document.createElement('canvas'));"
-                 "if(c.width!==v.videoWidth)c.width=v.videoWidth;"
-                 "if(c.height!==v.videoHeight)c.height=v.videoHeight;"
-                 "var g=c.getContext('2d');g.clearRect(0,0,c.width,c.height);g.drawImage(v,0,0);"
-                 "frame=c.toDataURL('image/png').split(',')[1];window.__lastCaptured=serial;}"
+                 "var cw=Math.min(v.videoWidth,window.__captureWidth||v.videoWidth);"
+                 "var ch=Math.round(cw*v.videoHeight/v.videoWidth);"
+                 "if(c.width!==cw)c.width=cw;if(c.height!==ch)c.height=ch;"
+                 "var g=c.getContext('2d');g.imageSmoothingEnabled=true;g.imageSmoothingQuality='high';"
+                 "g.clearRect(0,0,c.width,c.height);g.drawImage(v,0,0,c.width,c.height);"
+                 "var a=g.getImageData(0,0,c.width,c.height).data;"
+                 "var x0=c.width,y0=c.height,x1=-1,y1=-1;"
+                 "for(var y=0;y<c.height;y+=2){for(var x=0;x<c.width;x+=2){"
+                 "if(a[(y*c.width+x)*4+3]>4){if(x<x0)x0=x;if(x>x1)x1=x;if(y<y0)y0=y;if(y>y1)y1=y;}}}"
+                 "if(x1>=0){fx=Math.max(0,x0-4);fy=Math.max(0,y0-4);"
+                 "var right=Math.min(c.width,x1+5),bottom=Math.min(c.height,y1+5);"
+                 "var cc=window.__cropCanvas||(window.__cropCanvas=document.createElement('canvas'));"
+                 "cc.width=right-fx;cc.height=bottom-fy;"
+                 "cc.getContext('2d').drawImage(c,fx,fy,cc.width,cc.height,0,0,cc.width,cc.height);"
+                 "frame=cc.toDataURL('image/png').split(',')[1];fw=c.width;fh=c.height;}"
+                 "window.__lastCaptured=serial;}"
                  "return {w:v.videoWidth,h:v.videoHeight,t:v.currentTime,dur:v.duration||0,"
                  "ended:!!v.ended,err:(window.__st&&window.__st.err)||'',"
-                 "name:(window.__st&&window.__st.name)||'',frame:frame,"
+                 "name:(window.__st&&window.__st.name)||'',frame:frame,frameX:fx,frameY:fy,frameW:fw,frameH:fh,"
                  "frameReady:!!(window.__st&&window.__st.frameReady),readyState:v.readyState};})())")
 VIDEO_MEASURE_JS = (
     "(function(){try{var v=document.querySelector('video');"
@@ -3384,9 +3405,85 @@ class EyeRestOverlay(QWidget):
         self.feedback.setText(random.choice(EYE_REST_RETORT_LINES))
 
 
+class _NativeWebMDecoder(QThread):
+    """在后台直接解码 VP9 alpha，避免浏览器每帧编码 PNG 和跨进程传递 Base64。"""
+    processed = Signal(object)
+    bounds_ready = Signal(object)
+    clip_ended = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, path, clip, loop, generation, rect, dpr):
+        super().__init__()
+        self.path, self.clip, self.loop, self.generation = path, clip, loop, generation
+        self.render_target = (QRectF(rect), dpr)
+        self.process = None
+        self.width, self.height = ((1280, 720) if os.path.basename(os.path.dirname(path)) == "hd" else (640, 360))
+
+    def stop(self):
+        self.requestInterruption()
+        process = self.process
+        if process is not None and process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        self.wait(3000)
+
+    def run(self):
+        command = [VIDEO_FFMPEG, "-v", "error", "-threads", "2"]
+        if self.loop:
+            command += ["-stream_loop", "-1"]
+        command += ["-c:v", "libvpx-vp9", "-i", self.path, "-an",
+                    "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
+        try:
+            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                            creationflags=subprocess.CREATE_NO_WINDOW)
+            count = self.width * self.height * 4
+            index = 0
+            started = None
+            while not self.isInterruptionRequested():
+                data = self.process.stdout.read(count)
+                if len(data) != count:
+                    if not self.isInterruptionRequested():
+                        if self.process.wait() != 0:
+                            self.failed.emit("原生视频解码失败")
+                        else:
+                            self.clip_ended.emit(self.clip)
+                    break
+                image = QImage(data, self.width, self.height, self.width*4,
+                               QImage.Format.Format_RGBA8888).copy()
+                if index == 0 and PILImage is not None:
+                    alpha = PILImage.frombytes("RGBA", (self.width,self.height), data).getchannel("A")
+                    bounds = alpha.point(lambda a:255 if a>12 else 0).getbbox()
+                    if bounds:
+                        x0,y0,x1,y1 = bounds
+                        self.bounds_ready.emit(dict(w=self.width,h=self.height,x0=x0/self.width,
+                            y0=y0/self.height,x1=x1/self.width,y1=y1/self.height))
+                rect,dpr = self.render_target
+                result = VideoBody._process_frame(self.clip,self.generation,image,rect,dpr)
+                if started is None:
+                    started = time.perf_counter()
+                deadline = started + index/24.0
+                while time.perf_counter()<deadline and not self.isInterruptionRequested():
+                    self.msleep(min(5,max(1,int((deadline-time.perf_counter())*1000))))
+                if self.isInterruptionRequested():
+                    break
+                self.processed.emit(result)
+                index += 1
+        except (OSError, ValueError) as error:
+            if not self.isInterruptionRequested():
+                self.failed.emit("原生视频解码失败：%s" % str(error)[:80])
+        finally:
+            if self.process is not None:
+                if self.process.poll() is None:
+                    self.process.kill()
+                self.process.wait()
+                self.process.stdout.close()
+
+
 class VideoBody(QWidget):
+    """后台 WebM 解码器：优先直接解码，缺少 FFmpeg 时使用隐藏的浏览器。"""
     _frame_processed = Signal(object)
-    """隐藏的 WebM 解码器：将透明视频帧交给桌宠本体绘制，不显示浏览器窗口。"""
 
     def __init__(self, on_clip_end=None, parent=None):
         super().__init__(parent)
@@ -3396,6 +3493,8 @@ class VideoBody(QWidget):
         self.on_clip_end = on_clip_end
         self.target_pet = None           # 收到新的视频帧时重绘桌宠本体
         self.view = None
+        self.native_decoder = None
+        self.use_native = bool(VIDEO_FFMPEG)
         self.profile = None
         self.ready = False
         self.page_loaded = False
@@ -3408,6 +3507,7 @@ class VideoBody(QWidget):
         self._frame_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pet-frame")
         QApplication.instance().aboutToQuit.connect(
             lambda: self._frame_executor.shutdown(wait=True, cancel_futures=True))
+        QApplication.instance().aboutToQuit.connect(self._stop_native)
         self._frame_processed.connect(self._accept_processed_frame)
         self.clip = ""
         self.loaded_clip = ""
@@ -3427,7 +3527,10 @@ class VideoBody(QWidget):
 
     # ---------- 建 ----------
     def ensure(self):
-        """按需创建浏览器视图（省内存）"""
+        """优先原生解码；浏览器兼容通道按需创建。"""
+        if self.use_native:
+            self.ready = self.page_loaded = True
+            return True
         if self.view is not None or not WEBENGINE_OK:
             return self.view
         base = os.path.join(APP_DIR, "runtime", "_webengine_video")
@@ -3494,12 +3597,15 @@ class VideoBody(QWidget):
         self.page_loaded = True
         # 页面保持媒体解码状态，QWebEngineView 本身始终不显示到桌面。
         self.view.page().setVisible(True)
+        if hasattr(self, "_capture_width"):
+            self._js("window.__captureWidth=%d" % self._capture_width)
         pending = self.pending_clip
         self.pending_clip = None
         if pending:
             self._start_clip(*pending)
 
     def _fail(self, message):
+        self._stop_native()
         self.clip = ""
         self.loaded_clip = ""
         self.pending_clip = None
@@ -3542,6 +3648,27 @@ class VideoBody(QWidget):
         return True
 
     def _start_clip(self, clip, loop):
+        if self.use_native:
+            if (self.native_decoder is not None and self.native_decoder.isRunning()
+                    and clip == self.loaded_clip and loop == self.native_decoder.loop):
+                return
+            self._stop_native()
+            self._decode_generation += 1
+            self.frame_ready = False
+            self.frame_image = None
+            hd_path = os.path.join(ANIM_DIR, "hd", clip+".webm")
+            path = hd_path if os.path.isfile(hd_path) else os.path.join(ANIM_DIR,clip+".webm")
+            pet = self.target_pet
+            decoder = _NativeWebMDecoder(path,clip,loop,self._decode_generation,self.render_rect,
+                                         pet.devicePixelRatioF() if pet is not None else 1.0)
+            decoder.processed.connect(self._accept_processed_frame)
+            decoder.bounds_ready.connect(self._native_bounds)
+            decoder.clip_ended.connect(self._native_end)
+            decoder.failed.connect(self._fail)
+            self.native_decoder = decoder
+            self.loaded_clip = clip
+            decoder.start()
+            return
         if clip != self.loaded_clip:
             self._decode_generation += 1
             self.frame_ready = False
@@ -3554,6 +3681,7 @@ class VideoBody(QWidget):
                      % ("true" if loop else "false"))
 
     def stop(self):
+        self._stop_native()
         self._decode_generation += 1
         self.clip = ""
         self.loaded_clip = ""
@@ -3562,6 +3690,20 @@ class VideoBody(QWidget):
         self.frame_image = None
         self._js("var e=document.getElementById('v'); if(e){e.pause();}")
         self.hide()
+
+    def _stop_native(self):
+        decoder = self.native_decoder
+        if decoder is not None:
+            self.native_decoder = None
+            decoder.stop()
+
+    def _native_bounds(self, bounds):
+        if self.sender() is self.native_decoder and self.clip in ANIM_POOLS.get("待机", []) and self.bbox is None:
+            self._got_bbox(bounds)
+
+    def _native_end(self, clip):
+        if self.sender() is self.native_decoder and clip == self.clip and not self.loop and self.on_clip_end:
+            self.on_clip_end(clip)
 
     def measure(self):
         """量一下角色在画幅里的位置（用来和立绘对齐）"""
@@ -3617,6 +3759,14 @@ class VideoBody(QWidget):
             return
         if frame:
             image = QImage.fromData(base64.b64decode(frame), "PNG")
+            full_w, full_h = int(v.get("frameW", 0)), int(v.get("frameH", 0))
+            if not image.isNull() and full_w and full_h:
+                full_image = QImage(full_w, full_h, QImage.Format.Format_ARGB32_Premultiplied)
+                full_image.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(full_image)
+                painter.drawImage(int(v.get("frameX", 0)), int(v.get("frameY", 0)), image)
+                painter.end()
+                image = full_image
             if not image.isNull():
                 pet = self.target_pet
                 if pet is not None:
@@ -3683,6 +3833,12 @@ class VideoBody(QWidget):
         pet = self.target_pet
         if pet is not None:
             self.render_rect = QRectF(cx - cx_v - pet.x(), bottom - feet - pet.y(), vw, vh)
+            if self.native_decoder is not None:
+                self.native_decoder.render_target = (QRectF(self.render_rect),pet.devicePixelRatioF())
+            capture_width = max(640, int(round(vw * pet.devicePixelRatioF())))
+            if capture_width != getattr(self, "_capture_width", None):
+                self._capture_width = capture_width
+                self._js("window.__captureWidth=%d" % capture_width)
         self.set_mirror(mirror)
         if rect != self._last_rect:
             self._last_rect = rect
@@ -4436,7 +4592,7 @@ class PetWindow(QWidget):
 
     def video_ready(self):
         """视频模式能用吗：开关开着 + 内嵌 Chromium 可用 + anim/ 里有素材"""
-        if self._video_failed or not WEBENGINE_OK:
+        if self._video_failed or not (VIDEO_FFMPEG or WEBENGINE_OK):
             return False
         if not self.cfg.get("video_anim", True):
             return False

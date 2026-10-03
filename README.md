@@ -123,7 +123,7 @@ pip install -r requirements.txt
   照镜子 / 开心跳 / 害羞 / 打招呼 / 鼓成一团 / 被挠痒 / 思考 / 垂头叹气 / 垂头。
   改 `ACTIONS` 表里的 `weight` 就能调频率
 - **拖着甩出去**：松手速度够大就抛物线飞出去、屏幕四边反弹、空气阻力 + 落地摩擦、落地 Q 弹
-- **视频动画版**：106 个 VP9-alpha 透明 webm（`anim/`），由隐藏的 Chromium 解码，透明帧直接画在桌宠本体窗口；
+- **视频动画版**：106 个 VP9-alpha 透明 webm（`anim/`），优先由后台 FFmpeg 原生解码，缺少 FFmpeg 时使用隐藏的 Chromium；透明帧直接画在桌宠本体窗口；
   `config.json` 里 `video_anim: false` 或 `anim/` 没素材时自动退回手绘立绘
 - **AI 分身（一个窗口全搞定）**：对话 / 干活 / 看网页都在同一个窗口
   - 工具：`web_search`（DDG + Bing 双源合并去重）、`fetch_url`（读网页原文），最多来回 4 轮（`task_max_rounds`）
@@ -215,6 +215,8 @@ pip install -r requirements.txt
 - 视频与立绘共用本体窗口；窗口轮廓随角色和气泡更新，透明空隙可点击穿透，角色可直接点击和拖拽。
 - 按显示器实际像素绘制，适配 125% / 150% 等显示缩放；立绘直接采样原图，避免先缩小再放大的模糊。Windows 本体窗口关闭系统背景、圆角及边框。
 - 动画帧在后台使用 Lanczos 缩放和轻微锐化，保持角色透明轮廓；移动使用 16 毫秒精确定时器，同一帧的图像和轮廓会复用。动画帧率仍受原素材与解码速度限制。
+- 高清动画放在 `anim/hd/`，有同名文件时优先播放 1280×720 版本。高清版从上游原始 720p 视频提取颜色细节，复用原版人工抠像的透明通道，并未把 360p 视频直接放大；原始 `anim/*.webm` 保留用于回退。
+- 安装 `imageio-ffmpeg` 后，高清播放跳过浏览器逐帧 PNG 编码和 Base64 传输，按源视频的 24 FPS 播放；移动刷新仍为约 60 Hz。106 段高清素材约占 669 MiB，来源、帧数及校验值记录在 `anim/hd/manifest.json`。
 
 ### 天气 / 定位 / 城市
 
@@ -381,6 +383,13 @@ python tools/preprocess2.py    # 边缘去污 + 预乘 alpha 缩放出各尺寸
 > 所以 `pip install -r requirements.txt` 会一起装上。
 > 只装 `PySide6` 的话跑这两个脚本会报 `ModuleNotFoundError: No module named 'PIL'` ——
 > 主程序的动画清晰度增强也使用 Pillow；未安装时可以运行，但会使用普通缩放。
+
+高清动画生成工具 `tools/build_hd_animations.py` 另外需要 `numpy`、`opencv-python`、`imageio-ffmpeg`。
+从[上游源视频包](https://github.com/PC2005-cloud/dsh-pet/releases/tag/assets-videos)提取与 `anim/` 同名的 mp4 后，可运行：
+
+```powershell
+python tools/build_hd_animations.py --sources "源视频目录" --output anim/hd --records "..\build/records\高清生成"
+```
 
 > 开源版改动：这两个脚本原来把作者的素材路径**写死**在代码里（`D:\` 盘下的私人文件夹），
 > 现在改成从环境变量 `DAFEIYU_SRC` / `DAFEIYU_OUT` 读，输出默认写到本仓库的 `sprites/`。

@@ -36,6 +36,7 @@ dist/
 # Python 缓存
 __pycache__/
 *.pyc
+*.partial.webm
 
 # 自检脚本的临时目录
 _selftest_tmp/
