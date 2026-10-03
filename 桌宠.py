@@ -3256,7 +3256,8 @@ class EyeRestOverlay(QWidget):
 
     def __init__(self, pixmap, on_finish, parent=None):
         super().__init__(None, Qt.WindowType.FramelessWindowHint
-                         | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+                         | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
+                         | Qt.WindowType.NoDropShadowWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("护眼时间")
         _t = _theme()
@@ -3414,7 +3415,8 @@ class VideoBody(QWidget):
 
     def __init__(self, on_clip_end=None, parent=None):
         super().__init__(None, Qt.WindowType.FramelessWindowHint
-                         | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+                         | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
+                         | Qt.WindowType.NoDropShadowWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setWindowTitle("大肥鱼（视频）")
@@ -3465,6 +3467,7 @@ class VideoBody(QWidget):
             print("视频 profile 没建好:", e)
             return None
         self.view = QWebEngineView(self)
+        self.view.setStyleSheet("QWebEngineView { border: none; background: transparent; }")
         page = QWebEnginePage(self.profile, self.view)
         self.view.setPage(page)
         page.renderProcessTerminated.connect(self._on_render_process_terminated)
@@ -3846,7 +3849,8 @@ class PetWindow(QWidget):
             self._key_plaintext = True       # DPAPI 不可用，只能明文存在 config.json 里
         apply_runtime_config(self.cfg)
         
-        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+        flags = (Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+                 | Qt.WindowType.NoDropShadowWindowHint)
         if self.cfg.get("topmost", True):
             flags |= Qt.WindowType.WindowStaysOnTopHint
         super().__init__(None, flags)

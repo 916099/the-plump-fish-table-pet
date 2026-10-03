@@ -1,7 +1,5 @@
 @echo off
 cd /d "%~dp0"
-if exist ".venv\Scripts\pythonw.exe" (
-    start "" ".venv\Scripts\pythonw.exe" "×À³è.py"
-) else (
-    start "" pythonw "×À³è.py"
-)
+set "PYTHONW=%~dp0.venv\Scripts\pythonw.exe"
+if not exist "%PYTHONW%" set "PYTHONW=pythonw"
+for %%F in ("%~dp0*.py") do start "" "%PYTHONW%" "%%~fF"
