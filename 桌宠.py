@@ -4079,6 +4079,7 @@ class PetWindow(QWidget):
         self._edge_impact_pause_until = 0.0
         self._edge_impact_cooldown_until = 0.0
         self._next_action = None      # 排队的下一个动作（比如点击：先挤压再回应）
+        self._action_cooldown_until = 0.0
         # 视频动画（106 个透明 webm，见 anim/）
         self.video = None
         self._anim_set = None
@@ -4674,6 +4675,9 @@ class PetWindow(QWidget):
         """落地收尾结束后停住三秒，再交回待机/移动逻辑。"""
         self._edge_impact_post_landing = False
         self._edge_impact_pause_until = time.monotonic() + 3.0
+        self._next_action = None
+        self._action_cooldown_until = max(
+            self._action_cooldown_until, self._edge_impact_pause_until)
         self.target = None
         self.cur_speed = 0.0
         self.rest_until = self.t * TICK + 3000
@@ -4883,6 +4887,13 @@ class PetWindow(QWidget):
                 if drag:
                     self.video.play(drag, loop=True)
                     return
+            if self._next_action:
+                nxt = self._next_action
+                self._next_action = None
+                self.play_action(nxt, force=True)
+                return
+            self._action_cooldown_until = max(
+                self._action_cooldown_until, time.monotonic() + 5.0)
             idle = self.clip_for("待机")
             if idle:
                 self.video.play(idle, loop=True)
@@ -4947,7 +4958,8 @@ class PetWindow(QWidget):
         if (self.video_ready() and self.video is not None
                 and self.video.bbox is None):
             return                                       # 还没量到角色位置 → 先让待机多播会儿
-        if random.random() < 0.010 * FRAME_INTERVAL / TICK:
+        if (time.monotonic() >= self._action_cooldown_until and
+                random.random() < 0.001 * FRAME_INTERVAL / TICK):
             if self.video_ready():
                 self.play_random_clip()                  # 视频模式：随机抽一个 clip
             else:
@@ -4978,18 +4990,33 @@ class PetWindow(QWidget):
         a = _ACTION_BY_KEY.get(key)
         if not a:
             return
+        if force:
+            self._next_action = None
+        else:
+            now = time.monotonic()
+            if (self._edge_impact_pending_rest or
+                    now < self._edge_impact_until or
+                    self._edge_impact_post_landing or
+                    now < self._edge_impact_pause_until):
+                return
+            if self.action:
+                if self.action == key:
+                    return
+                self._next_action = key
+                return
+            if (self.video_ready() and self.video is not None and
+                    self.video.clip and not self.video.loop):
+                if self.video.clip == ACTION_TO_CLIP.get(key):
+                    return
+                if self._next_action != key:
+                    self._next_action = key
+                return
         if key != "squash" and self.video_ready():
             clip = ACTION_TO_CLIP.get(key, "")
             loop = key == "bump" and (self._edge_impact_pending_rest or
                                        self._edge_impact_until > time.monotonic())
             if clip and clip in self.anim_names() and self.show_clip(clip, loop=loop):
                 self._bubble_now(bubble or a.get("bubble"), 1400)
-                return
-        if self.action and not force:
-            if self.action == key and self.action_left > 3:
-                return                                   # 同一个动作别打断重来
-            if self.action_left > 4:
-                self._next_action = key                  # 先排队，等这个演完
                 return
         self.action = key
         self.action_total = self.action_left = max(1, int(a["ticks"]))
@@ -5013,14 +5040,13 @@ class PetWindow(QWidget):
             self._next_action = None
             self._start_edge_impact_pause()
             return
+        self._action_cooldown_until = max(
+            self._action_cooldown_until, time.monotonic() + 5.0)
         nxt = self._next_action                          # 排队的优先
         self._next_action = None
         if nxt:
             self.play_action(nxt, force=True)
             return
-        # 首尾相接：有一定概率马上接下一个（像 dsh-pet 的动画链）
-        if was not in ("squash", "droop", "think", "bump") and random.random() < 0.35:
-            self.play_action(self._pick_action())
 
     def _action_progress(self):
         if not self.action or self.action_total <= 0:
