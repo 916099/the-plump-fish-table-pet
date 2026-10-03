@@ -3731,7 +3731,10 @@ class VideoBody(QWidget):
                   % (v["x0"], v["x1"], v["y0"], v["y1"], v["w"], v["h"]))
             if self._fit_args:            # 量到了就按真实位置重摆一次
                 try:
-                    self.fit_to(*self._fit_args)
+                    if self.target_pet is not None:
+                        self.target_pet._sync_video()
+                    else:
+                        self.fit_to(*self._fit_args)
                 except Exception as e:
                     print("重摆视频窗失败:", e)
 
@@ -3825,6 +3828,28 @@ class VideoBody(QWidget):
         bb = self.bbox or {"x0": 0.28, "x1": 0.72, "y0": 0.20, "y1": 0.85}
         ch = max(0.15, min(1.0, bb["y1"] - bb["y0"]))
         vh = max(60.0, sprite_h / ch)
+        pet = self.target_pet
+        if pet is not None:
+            # 缩放依据完整源画幅，不能依据当前帧的道具包围盒，否则角色会忽大忽小。
+            geo = pet._scene_screen_rect()
+            def canvas_at(height):
+                width = height * 16.0 / 9.0
+                scene = QRectF(pet.win_w / 2 - (bb["x0"] + bb["x1"]) / 2 * width,
+                               BUBBLE_H + MARGIN + sprite_h - bb["y1"] * height,
+                               width, height)
+                return QRectF(0, 0, pet.win_w, pet.win_h).united(
+                    scene.adjusted(-2, -2, 2, 2)).toAlignedRect()
+            area = canvas_at(vh)
+            if area.width() > geo.width() or area.height() > geo.height():
+                low, high = 0.0, vh
+                for _ in range(20):
+                    mid = (low + high) / 2
+                    area = canvas_at(mid)
+                    if area.width() <= geo.width() and area.height() <= geo.height():
+                        low = mid
+                    else:
+                        high = mid
+                vh = low
         vw = vh * 16.0 / 9.0
         feet = bb["y1"] * vh
         cx_v = (bb["x0"] + bb["x1"]) / 2.0 * vw
@@ -4483,6 +4508,11 @@ class PetWindow(QWidget):
 
     def _move_body(self, *args):
         position = QPoint(*args) if len(args) == 2 else QPoint(args[0])
+        video = getattr(self, "video", None)
+        if video is not None and video.clip and not video.render_rect.isEmpty():
+            left, top, right, bottom = self._scene_body_limits()
+            position = QPoint(max(left, min(right, position.x())),
+                              max(top, min(bottom, position.y())))
         self.move(position - self._canvas_offset)
 
     def _fit_animation_canvas(self, scene=None):
@@ -4500,6 +4530,32 @@ class PetWindow(QWidget):
             self._video_paint_key = None
         return offset
 
+    def _scene_screen_rect(self):
+        center = self._body_pos() + QPoint(self.win_w // 2, self.win_h // 2)
+        screen = QApplication.screenAt(center) or self.screen() or QApplication.primaryScreen()
+        return screen.availableGeometry()
+
+    def _scene_body_limits(self):
+        """角色坐标可移动的范围，同时给整个场景留出空间。"""
+        geo = self._scene_screen_rect()
+        offset = self._canvas_offset
+        return (geo.left() + offset.x(), geo.top() + offset.y(),
+                geo.left() + max(0, geo.width() - self.width()) + offset.x(),
+                geo.top() + max(0, geo.height() - self.height()) + offset.y())
+
+    def _keep_scene_on_screen(self):
+        left, top, right, bottom = self._scene_body_limits()
+        position = self._movement_position()
+        x = max(left, min(right, position.x()))
+        y = max(top, min(bottom, position.y()))
+        changed = (round(x), round(y)) != (self._body_pos().x(), self._body_pos().y())
+        if changed:
+            self._move_precise(x, y)
+        if self.target is not None:
+            self.target = (max(left + self.win_w / 2, min(right + self.win_w / 2, self.target[0])),
+                           max(top + self.win_h / 2, min(bottom + self.win_h / 2, self.target[1])))
+        return changed
+
     # ---------- 逻辑 ----------
     def _movement_position(self):
         # QWidget 位置是整数；保留小数余量，避免高刷新率下左右速度不一致。
@@ -4508,6 +4564,10 @@ class PetWindow(QWidget):
         return self._movement_float_pos
 
     def _move_precise(self, x, y):
+        video = getattr(self, "video", None)
+        if video is not None and video.clip and not video.render_rect.isEmpty():
+            left, top, right, bottom = self._scene_body_limits()
+            x, y = max(left, min(right, x)), max(top, min(bottom, y))
         self._movement_float_pos = QPointF(x, y)
         self._move_body(round(x), round(y))
         self._movement_widget_pos = self._body_pos()
@@ -4691,9 +4751,16 @@ class PetWindow(QWidget):
             return
         if not self.isVisible():
             return                    # 本体藏起来了（护眼/显示隐藏）→ 视频也别冒出来
-        cx = self._body_pos().x() + self.win_w / 2
+        anchor = self._body_pos()
+        cx = anchor.x() + self.win_w / 2
         bottom = self._body_pos().y() + BUBBLE_H + MARGIN + self.cur_h
         self.video.fit_to(cx, bottom, self.cur_h, mirror=self.facing < 0)
+        moved = self._keep_scene_on_screen()
+        if moved or anchor != self._body_pos():
+            # 更新记录的全局锚点，避免异步量到角色包围盒后使用旧位置重新摆放。
+            cx = self._body_pos().x() + self.win_w / 2
+            bottom = self._body_pos().y() + BUBBLE_H + MARGIN + self.cur_h
+            self.video.fit_to(cx, bottom, self.cur_h, mirror=self.facing < 0)
 
     def set_video_anim(self, on):
         """切换视频动画 / 手绘立绘"""
@@ -4811,20 +4878,18 @@ class PetWindow(QWidget):
         self._bubble_now("💨", 900)
 
     def _fly_step(self):
-        screen = self.screen() or QApplication.primaryScreen()
-        geo = screen.availableGeometry()
+        left, top, right, ground = self._scene_body_limits()
         time_step = FRAME_INTERVAL / TICK
         self.vy += 1.15 * time_step                        # 重力
         position = self._movement_position()
         nx = position.x() + self.vx * time_step
         ny = position.y() + self.vy * time_step
-        if nx < geo.left():
-            nx, self.vx = geo.left(), -self.vx * 0.55
-        elif nx + self.win_w > geo.right():
-            nx, self.vx = geo.right() - self.win_w, -self.vx * 0.55
-        if ny < geo.top():
-            ny, self.vy = geo.top(), -self.vy * 0.45
-        ground = geo.bottom() - self.win_h
+        if nx < left:
+            nx, self.vx = left, -self.vx * 0.55
+        elif nx > right:
+            nx, self.vx = right, -self.vx * 0.55
+        if ny < top:
+            ny, self.vy = top, -self.vy * 0.45
         if ny >= ground:
             ny = ground
             if abs(self.vy) < 2.2:
