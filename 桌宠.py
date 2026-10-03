@@ -182,6 +182,7 @@ _BOOT_NOTE = ""      # bootstrap_config() 留给启动后气泡提示用
 
 BUBBLE_H = 56
 MARGIN = 4
+ANIMATION_FRAME_SCALE = 1.35  # 摄像范围放大 35%，一次展示更多动作环境
 SIZE_LEVELS = {"小": 0.55, "中": 0.7, "大": 0.9}
 SPEED = 380.0
 TICK = 20
@@ -3827,7 +3828,7 @@ class VideoBody(QWidget):
             self.measure()
         bb = self.bbox or {"x0": 0.28, "x1": 0.72, "y0": 0.20, "y1": 0.85}
         ch = max(0.15, min(1.0, bb["y1"] - bb["y0"]))
-        vh = max(60.0, sprite_h / ch)
+        vh = max(60.0, sprite_h / ch * ANIMATION_FRAME_SCALE)
         pet = self.target_pet
         if pet is not None:
             # 缩放依据完整源画幅，不能依据当前帧的道具包围盒，否则角色会忽大忽小。
@@ -4516,7 +4517,7 @@ class PetWindow(QWidget):
         self.move(position - self._canvas_offset)
 
     def _fit_animation_canvas(self, scene=None):
-        """完整保留源视频画幅；透明部分仍由原生 alpha 轮廓穿透。"""
+        """扩大视频画幅显示更多动作环境；透明部分仍由原生 alpha 轮廓穿透。"""
         area = QRectF(0, 0, self.win_w, self.win_h)
         if scene is not None:
             area = area.united(scene.adjusted(-2, -2, 2, 2))
