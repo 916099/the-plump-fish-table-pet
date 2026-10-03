@@ -45,7 +45,8 @@ except:
 
 import requests
 from PySide6.QtCore import (Qt, QTimer, QPoint, QPointF, QRectF,
-                            QAbstractNativeEventFilter, QObject, Signal, QUrl, QThread)
+                            QAbstractNativeEventFilter, QObject, Signal, QUrl, QThread,
+                            QLibraryInfo)
 try:                                    # 内嵌 Chromium（必须在 QApplication 之前导入）
     from PySide6.QtWebEngineWidgets import QWebEngineView
     from PySide6.QtWebEngineCore import (QWebEngineProfile, QWebEnginePage,
@@ -3466,6 +3467,7 @@ class VideoBody(QWidget):
         self.view = QWebEngineView(self)
         page = QWebEnginePage(self.profile, self.view)
         self.view.setPage(page)
+        page.renderProcessTerminated.connect(self._on_render_process_terminated)
         self.view.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         try:
             page.setBackgroundColor(QColor(0, 0, 0, 0))        # 透明底的关键
@@ -3494,6 +3496,17 @@ class VideoBody(QWidget):
             self.view.setHtml(VIDEO_HTML, QUrl.fromLocalFile(ANIM_DIR + os.sep))
         self.ready = True
         return self.view
+
+    def _on_render_process_terminated(self, status, exit_code):
+        """Chromium 子进程崩溃时收起空视频窗，立即恢复 PNG 立绘。"""
+        print("[视频] Chromium 渲染进程退出：%s，代码 %s" % (status, exit_code))
+        self.clip = ""
+        self.hide()
+        pet = self.target_pet
+        if pet is not None:
+            pet._video_failed = True
+            pet.update()
+            pet.say("视频动画没启动起来，我先切回立绘～")
 
     # ---------- 播 ----------
     def _js(self, code, cb=None):
@@ -3566,6 +3579,16 @@ class VideoBody(QWidget):
         if not isinstance(v, dict):
             return
         self.info = v
+        if v.get("err"):
+            print("[视频] 播放失败：", v["err"])
+            pet = self.target_pet
+            self.clip = ""
+            self.hide()
+            if pet is not None:
+                pet._video_failed = True
+                pet.update()
+                pet.say("视频动画没播起来，我先切回立绘～")
+            return
         if v.get("ended") and not self.loop and self.clip:
             if time.time() - self._last_end > 0.8:
                 self._last_end = time.time()
@@ -5537,6 +5560,30 @@ def single_instance_guard():
         return True
 
 
+def _prepare_webengine_process_path():
+    """让 QtWebEngine 的独立 Chromium 子进程也能找到 Qt/Conda DLL。"""
+    if os.name != "nt" or not WEBENGINE_OK:
+        return
+    try:
+        candidates = [
+            QLibraryInfo.path(QLibraryInfo.LibraryPath.BinariesPath),
+            os.path.join(getattr(sys, "base_prefix", sys.prefix), "Library", "bin"),
+        ]
+        current = os.environ.get("PATH", "").split(os.pathsep)
+        normalize = lambda p: os.path.normcase(os.path.normpath(p.strip('"'))) if p else ""
+        known = {normalize(p) for p in current}
+        add = []
+        for path in candidates:
+            if path and os.path.isdir(path) and normalize(path) not in known:
+                add.append(path)
+                known.add(normalize(path))
+        if add:
+            os.environ["PATH"] = os.pathsep.join(add + current)
+            print("[视频] 已加入 Chromium 子进程 DLL 路径：", "; ".join(add))
+    except Exception as e:
+        print("[视频] 设置 Chromium 子进程 DLL 路径失败：", e)
+
+
 def main():
     global _BOOT_NOTE
     # ★ 最先做：定配置位置（%APPDATA% / 便携）→ 搬迁老配置 → 把明文 Key 收进加密仓库。
@@ -5546,6 +5593,7 @@ def main():
     except Exception as e:
         print("配置初始化失败（继续用默认位置）:", e)
         _BOOT_NOTE = ""
+    _prepare_webengine_process_path()
     try:      # QtWebEngine（内嵌 Chromium）需要这个属性，必须在 QApplication 之前设
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     except Exception:
