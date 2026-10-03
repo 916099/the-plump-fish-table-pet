@@ -182,7 +182,7 @@ _BOOT_NOTE = ""      # bootstrap_config() 留给启动后气泡提示用
 
 BUBBLE_H = 56
 MARGIN = 4
-ANIMATION_FRAME_SCALE = 1.35  # 摄像范围放大 35%，一次展示更多动作环境
+ANIMATION_FRAME_SCALE = 1.0   # 视频角色尺寸与原立绘保持一致，完整使用素材的16:9画幅
 SIZE_LEVELS = {"小": 0.55, "中": 0.7, "大": 0.9}
 SPEED = 380.0
 TICK = 20
