@@ -2228,6 +2228,28 @@ def scan_anims():
         return set()
 
 
+def _remove_dwm_border(widget):
+    """隐藏 Windows 11 DWM 给透明无边框窗口补上的外框。"""
+    if os.name != "nt":
+        return
+    try:
+        hwnd = int(widget.winId())
+        if getattr(widget, "_dwm_border_attempted_hwnd", None) == hwnd:
+            return
+        widget._dwm_border_attempted_hwnd = hwnd
+        dwm = ctypes.windll.dwmapi
+        dwm.DwmSetWindowAttribute.argtypes = (
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint)
+        dwm.DwmSetWindowAttribute.restype = ctypes.c_long
+        color = ctypes.c_uint32(0xFFFFFFFE)   # DWMWA_COLOR_NONE
+        result = dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 34, ctypes.byref(color),
+                                           ctypes.sizeof(color))  # DWMWA_BORDER_COLOR
+        if result != 0:
+            print("隐藏 DWM 窗口边框失败: HRESULT 0x%08X" % (result & 0xFFFFFFFF))
+    except Exception as e:
+        print("隐藏桌宠窗口边框失败:", e)
+
+
 _VIDEO_SERVER = {"port": 0, "srv": None}
 
 
@@ -3670,6 +3692,7 @@ class VideoBody(QWidget):
             self._set_region()
         if not self.isVisible():
             self.show()
+        _remove_dwm_border(self)
         self._click_through()
         self._hook_mouse()
 
@@ -4271,16 +4294,9 @@ class PetWindow(QWidget):
 
         cur_key = self._sprite_key(act.get("sprite"), act.get("facing"))
         if self.video is not None and self.video.isVisible() and self.video.frame_ready:
-            # 视频在顶着 → 立绘不画。但要在角色位置留一层「几乎全透明」的命中区：
-            # 分层窗口只有**完全透明**的像素才放过鼠标，alpha=1/255 就够把
-            # 点击/拖拽留在本体上（眼睛看不出来）。气泡照样画在下面。
-            hit = QRectF(cx - self.cur_h * 0.42, BUBBLE_H + MARGIN,
-                         self.cur_h * 0.84, self.cur_h)
+            # 视频顶替立绘时，以角色本身的透明轮廓承接鼠标，避免矩形点击区形成边框。
             p.setOpacity(1.0 / 255.0)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#ffffff"))
-            p.drawRoundedRect(hit, 14, 14)
-            p.setOpacity(1.0)
+            draw_one(cur_key, 1.0 / 255.0)
             return
         if self.cross_t > 0:
             draw_one(self.prev_key, self.cross_t)
@@ -4995,6 +5011,7 @@ class PetWindow(QWidget):
 
     def showEvent(self, e):
         super().showEvent(e)
+        _remove_dwm_border(self)
         if self.video_ready() and (self.video is None or not self.video.isVisible()):
             QTimer.singleShot(400, self._video_idle)     # 一出来就播待机动画
 
