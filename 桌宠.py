@@ -187,6 +187,7 @@ SIZE_LEVELS = {"小": 0.55, "中": 0.7, "大": 0.9}
 SPEED = 380.0
 TICK = 20
 FRAME_INTERVAL = 8                   # 约 120 Hz；逻辑时间和速度仍以原来的 20 ms 为基准
+ANIMATION_TRANSITION_SECONDS = 0.24  # 动作切换留出更柔和的过渡
 
 LINES = [
     "梁白开，更适合国人的大硬鲸模型",
@@ -4090,6 +4091,8 @@ class PetWindow(QWidget):
         self._video_transition_clip = None
         self._video_fade_started = None
         self._video_transition_from_image = None
+        self._idle_transition_from_image = None
+        self._idle_fade_started = None
         self._anim_set = None
         self._video_failed = False
         self._locate_queue = None
@@ -4343,12 +4346,23 @@ class PetWindow(QWidget):
         cache_key = None
         video_transition_alpha = 1.0
         video_transition_frame = None
+        idle_transition_alpha = 0.0
+        if self._idle_transition_from_image is not None:
+            if self._idle_fade_started is None:
+                self._idle_fade_started = shake_now
+            idle_progress = min(1.0, max(
+                0.0, (shake_now - self._idle_fade_started) / ANIMATION_TRANSITION_SECONDS))
+            eased = idle_progress * idle_progress * (3.0 - 2.0 * idle_progress)
+            idle_transition_alpha = 1.0 - eased
+            if idle_progress >= 1.0:
+                self._idle_transition_from_image = None
+                self._idle_fade_started = None
         if video is not None and video.frame_ready and video.frame_image is not None:
             if self._video_transition_clip == video.clip:
                 if self._video_fade_started is None:
                     self._video_fade_started = shake_now
                 fade_progress = min(1.0, max(
-                    0.0, (shake_now - self._video_fade_started) / 0.18))
+                    0.0, (shake_now - self._video_fade_started) / ANIMATION_TRANSITION_SECONDS))
                 video_transition_alpha = fade_progress * fade_progress * (3.0 - 2.0 * fade_progress)
                 if fade_progress < 1.0:
                     video_transition_frame = int(fade_progress * 60)
@@ -4529,7 +4543,15 @@ class PetWindow(QWidget):
                 draw_one(cur_key, action_blend)
             else:
                 draw_one(cur_key, 1.0)
+        if (self._idle_transition_from_image is not None and
+                idle_transition_alpha > 0.0):
+            p.save()
+            p.setOpacity(idle_transition_alpha)
+            p.drawImage(QRectF(0, 0, self.width(), self.height()),
+                        self._idle_transition_from_image)
+            p.restore()
         self._video_paint_key = None
+        self._video_paint_image = image
         self._present_pet_frame(image, p)
 
     def _quality_video_frame(self, rect, dpr):
@@ -4546,29 +4568,22 @@ class PetWindow(QWidget):
 
     @staticmethod
     def _build_quality_frame(source, rect, dpr):
-        """后台每帧缩放一次；锐化只改变颜色，保留 Lanczos 缩放后的 alpha。"""
+        """每帧始终缩放完整画幅，避免按变化的透明轮廓裁切造成画面跳动。"""
         default_bounds = (0, 0, source.width(), source.height())
         if PILImage is None or rect.isEmpty():
             return source, default_bounds
         rgba = source.convertToFormat(QImage.Format.Format_RGBA8888)
         pil = PILImage.frombytes("RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()))
-        # 解码器会在空白画幅留下 alpha=1 的噪点；不让这些噪点扩大缩放范围。
-        bounds = pil.getchannel("A").point(lambda a: 255 if a > 4 else 0).getbbox()
-        if not bounds:
-            return source, default_bounds
-        x0, y0, x1, y1 = bounds
-        bounds = (max(0, x0-2), max(0, y0-2), min(source.width(), x1+2), min(source.height(), y1+2))
-        x0, y0, x1, y1 = bounds
-        size = (max(1, round((x1-x0)*rect.width()/source.width()*dpr)),
-                max(1, round((y1-y0)*rect.height()/source.height()*dpr)))
-        scaled = pil.crop(bounds).resize(size, PILImage.Resampling.LANCZOS)
+        size = (max(1, round(rect.width() * dpr)),
+                max(1, round(rect.height() * dpr)))
+        scaled = pil.resize(size, PILImage.Resampling.LANCZOS)
         alpha = scaled.getchannel("A")
         scaled = scaled.convert("RGB").filter(ImageFilter.UnsharpMask(
             radius=0.55, percent=65, threshold=3)).convert("RGBA")
         scaled.putalpha(alpha)
         enhanced = QImage(scaled.tobytes(), size[0], size[1], size[0]*4,
                           QImage.Format.Format_RGBA8888).copy()
-        return enhanced, bounds
+        return enhanced, default_bounds
 
     def _present_pet_frame(self, image, painter):
         if painter is not None:
@@ -4775,7 +4790,7 @@ class PetWindow(QWidget):
         walk_target = (self.target is not None and not self.dragging and
                        not self.flying and not self.chat_paused and
                        self.mode in ("wander", "follow"))
-        walk_blend_step = min(1.0, FRAME_INTERVAL / 100.0)
+        walk_blend_step = min(1.0, FRAME_INTERVAL / 160.0)
         self._walk_pose_blend += (
             (1.0 if walk_target else 0.0) - self._walk_pose_blend) * walk_blend_step
         self._finish_edge_impact_if_due()
@@ -4932,6 +4947,8 @@ class PetWindow(QWidget):
             self._video_transition_from_image = previous.copy() if previous is not None else None
             self._video_transition_clip = clip
             self._video_fade_started = None
+            self._idle_transition_from_image = None
+            self._idle_fade_started = None
         ok = self.video.play(clip, loop=loop)
         self._sync_video()
         self.update()
@@ -4962,15 +4979,25 @@ class PetWindow(QWidget):
                 return
             self._action_cooldown_until = max(
                 self._action_cooldown_until, time.monotonic() + 5.0)
-            idle = self.clip_for("待机")
-            if idle:
-                self.show_clip(idle, loop=True)
+            self._video_idle()
 
     def _video_idle(self):
-        """没动作时就循环待机动画"""
+        """没动作时停在稳定立绘，避免待机呼吸素材带来持续微动。"""
         if not self.video_ready():
             return False
-        return self.show_clip(self.clip_for("待机"), loop=True)
+        previous = (self._video_paint_image
+                    if self.video is not None and self.video.frame_ready else None)
+        self._idle_transition_from_image = previous.copy() if previous is not None else None
+        self._idle_fade_started = time.monotonic() if previous is not None else None
+        if self.video is not None:
+            self.video.stop()
+        self._video_transition_clip = None
+        self._video_fade_started = None
+        self._video_transition_from_image = None
+        self._video_paint_key = None
+        self._video_paint_image = None
+        self.update()
+        return True
 
     def play_random_clip(self, say=False):
         pool = [c for c in (ANIM_POOLS["卖萌"] + ANIM_POOLS["玩耍"] + ANIM_POOLS["时节"])
@@ -5015,6 +5042,8 @@ class PetWindow(QWidget):
             self._video_transition_clip = None
             self._video_fade_started = None
             self._video_transition_from_image = None
+            self._idle_transition_from_image = None
+            self._idle_fade_started = None
             self._video_paint_image = None
             self._fit_animation_canvas()
             self.say("换回手绘立绘～")
@@ -5027,9 +5056,6 @@ class PetWindow(QWidget):
         if (self.video is not None and self.video.clip
                 and not self.video.loop):
             return                                       # 正在演一个动作 clip，别插队
-        if (self.video_ready() and self.video is not None
-                and self.video.bbox is None):
-            return                                       # 还没量到角色位置 → 先让待机多播会儿
         if (time.monotonic() >= self._action_cooldown_until and
                 random.random() < 0.001 * FRAME_INTERVAL / TICK):
             if self.video_ready():
