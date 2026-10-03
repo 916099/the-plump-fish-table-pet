@@ -3832,7 +3832,10 @@ class VideoBody(QWidget):
                 int(round(vw)), int(round(vh)))
         pet = self.target_pet
         if pet is not None:
-            self.render_rect = QRectF(cx - cx_v - pet.x(), bottom - feet - pet.y(), vw, vh)
+            scene = QRectF(cx - cx_v - pet._body_pos().x(),
+                           bottom - feet - pet._body_pos().y(), vw, vh)
+            offset = pet._fit_animation_canvas(scene)
+            self.render_rect = scene.translated(offset)
             if self.native_decoder is not None:
                 self.native_decoder.render_target = (QRectF(self.render_rect),pet.devicePixelRatioF())
             capture_width = max(640, int(round(vw * pet.devicePixelRatioF())))
@@ -3998,7 +4001,9 @@ class PetWindow(QWidget):
         self.cur_h = int(340 * self.cfg["size"])
         self.win_mx = int(self.cur_h * 0.062) + 6
         self.win_w = max(p.width() for k, p in self.sprites.items() if k[1] == self.cur_h) + self.win_mx * 2
-        self.setFixedSize(self.win_w, self.cur_h + BUBBLE_H + MARGIN * 2 + 10)
+        self.win_h = self.cur_h + BUBBLE_H + MARGIN * 2 + 10
+        self._canvas_offset = QPoint(0, 0)
+        self.setFixedSize(self.win_w, self.win_h)
 
         # 状态
         self.mode = self.cfg["mode"] if self.cfg["mode"] in ("wander", "follow", "still") else "wander"
@@ -4093,9 +4098,9 @@ class PetWindow(QWidget):
         x, y = self.cfg.get("x"), self.cfg.get("y")
         if x is None or y is None:
             screen = QApplication.primaryScreen().availableGeometry()
-            x = screen.right() - self.width() - 80
-            y = screen.bottom() - self.height() - 60
-        self.move(int(x), int(y))
+            x = screen.right() - self.win_w - 80
+            y = screen.bottom() - self.win_h - 60
+        self._move_body(int(x), int(y))
         self.show()
         self.snap_into_screen()
         if self.cfg.get("passthrough", False):
@@ -4162,8 +4167,8 @@ class PetWindow(QWidget):
 
     def _autosave_pos(self):
         """窗口位置只在变化时写盘"""
-        if (self.cfg.get("x"), self.cfg.get("y")) != (self.x(), self.y()):
-            self.cfg["x"], self.cfg["y"] = self.x(), self.y()
+        if (self.cfg.get("x"), self.cfg.get("y")) != (self._body_pos().x(), self._body_pos().y()):
+            self.cfg["x"], self.cfg["y"] = self._body_pos().x(), self._body_pos().y()
             self.save_config()
 
     # ---------- 配置文件热加载（开源版新增：改配置不用重启） ----------
@@ -4293,7 +4298,7 @@ class PetWindow(QWidget):
                 bfont = QFont(self.bubble_font)
                 bg, fg = QColor(*_t["bubble_bg"]), QColor(*_t["bubble_fg"])
             fm = QFontMetrics(bfont)
-            max_w = min(240, self.width() - 16)
+            max_w = min(240, self.win_w - 16)
             words = self.bubble_text
             lines = []
             cur = ""
@@ -4306,12 +4311,12 @@ class PetWindow(QWidget):
             lines.append(cur)
             bw = max(fm.horizontalAdvance(l) for l in lines) + 20
             bh = len(lines) * fm.height() + 14
-            bx = (self.width() - bw) / 2
-            by = 6.0
+            bx = self._canvas_offset.x() + (self.win_w - bw) / 2
+            by = self._canvas_offset.y() + 6.0
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(bg)
             p.drawRoundedRect(QRectF(bx, by, bw, bh), 10, 10)
-            tail = QPointF(self.width() / 2, by + bh)
+            tail = QPointF(self._canvas_offset.x() + self.win_w / 2, by + bh)
             p.drawPolygon(QPolygonF([tail, QPointF(tail.x() - 6, tail.y() + 8), QPointF(tail.x() + 6, tail.y() + 8)]))
             p.setPen(fg)
             p.setFont(bfont)
@@ -4319,7 +4324,7 @@ class PetWindow(QWidget):
                 p.drawText(QRectF(bx, by + 7 + i * fm.height(), bw, fm.height()),
                            Qt.AlignmentFlag.AlignCenter, l)
 
-        cx = self.width() / 2
+        cx = self._canvas_offset.x() + self.win_w / 2
         walking = self.target is not None and not self.dragging and not self.flying
         if walking:
             sway = math.sin(now * 9.0) * 3.5
@@ -4352,7 +4357,7 @@ class PetWindow(QWidget):
             ph = pix.height() * scale * (1 + act["sy"])
             pw = max(8.0, pix.width() * scale * (1 + act["sx"]))
             dx = cx - pw / 2 + act["dx"]
-            bottom = BUBBLE_H + MARGIN + self.cur_h
+            bottom = self._canvas_offset.y() + BUBBLE_H + MARGIN + self.cur_h
             dy = bottom - ph + jump + bob + act["dy"]
             p.save()
             p.setOpacity(opacity * act["alpha"])
@@ -4472,17 +4477,40 @@ class PetWindow(QWidget):
         if facing is not None and facing != self.facing:
             self.facing = facing
 
+    def _body_pos(self):
+        """持久化和移动使用角色原有坐标，扩展场景时不改变角色位置。"""
+        return self.pos() + self._canvas_offset
+
+    def _move_body(self, *args):
+        position = QPoint(*args) if len(args) == 2 else QPoint(args[0])
+        self.move(position - self._canvas_offset)
+
+    def _fit_animation_canvas(self, scene=None):
+        """完整保留源视频画幅；透明部分仍由原生 alpha 轮廓穿透。"""
+        area = QRectF(0, 0, self.win_w, self.win_h)
+        if scene is not None:
+            area = area.united(scene.adjusted(-2, -2, 2, 2))
+        area = area.toAlignedRect()
+        offset = QPoint(-area.x(), -area.y())
+        if self.size() != area.size() or offset != self._canvas_offset:
+            body_position = self._body_pos()
+            self._canvas_offset = offset
+            self.setFixedSize(area.size())
+            self._move_body(body_position)
+            self._video_paint_key = None
+        return offset
+
     # ---------- 逻辑 ----------
     def _movement_position(self):
         # QWidget 位置是整数；保留小数余量，避免高刷新率下左右速度不一致。
-        if getattr(self, "_movement_widget_pos", None) != self.pos():
-            self._movement_float_pos = QPointF(self.pos())
+        if getattr(self, "_movement_widget_pos", None) != self._body_pos():
+            self._movement_float_pos = QPointF(self._body_pos())
         return self._movement_float_pos
 
     def _move_precise(self, x, y):
         self._movement_float_pos = QPointF(x, y)
-        self.move(round(x), round(y))
-        self._movement_widget_pos = self.pos()
+        self._move_body(round(x), round(y))
+        self._movement_widget_pos = self._body_pos()
 
     def tick(self):
         time_step = FRAME_INTERVAL / TICK
@@ -4551,13 +4579,13 @@ class PetWindow(QWidget):
             cursor = self.cursor().pos()
             screen = QApplication.screenAt(cursor) or self.screen() or QApplication.primaryScreen()
             geo = screen.availableGeometry()
-            near = (self.x() - 100 <= cursor.x() <= self.x() + self.width() + 100 and
-                    self.y() - 100 <= cursor.y() <= self.y() + self.height() + 100)
+            near = (self._body_pos().x() - 100 <= cursor.x() <= self._body_pos().x() + self.win_w + 100 and
+                    self._body_pos().y() - 100 <= cursor.y() <= self._body_pos().y() + self.win_h + 100)
             if near:
                 self.target = None
             else:
-                tx = max(geo.left(), min(geo.right() - self.width(), cursor.x() - self.width() / 2))
-                ty = max(geo.top(), min(geo.bottom() - self.height(), cursor.y() - 90))
+                tx = max(geo.left(), min(geo.right() - self.win_w, cursor.x() - self.win_w / 2))
+                ty = max(geo.top(), min(geo.bottom() - self.win_h, cursor.y() - 90))
                 self.target = (tx, ty)
         elif self.mode == "wander":
             if self.target is None:
@@ -4566,8 +4594,8 @@ class PetWindow(QWidget):
                     self.update()
                     return
                 geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
-                self.target = (random.randint(geo.left() + 40, geo.right() - self.width() - 40),
-                               random.randint(geo.top() + 40, geo.bottom() - self.height() - 40))
+                self.target = (random.randint(geo.left() + 40, geo.right() - self.win_w - 40),
+                               random.randint(geo.top() + 40, geo.bottom() - self.win_h - 40))
         else:
             self._maybe_idle_action()
             self.update()
@@ -4575,7 +4603,7 @@ class PetWindow(QWidget):
 
         if self.target is not None:
             position = self._movement_position()
-            cx, cy = position.x() + self.width() / 2, position.y() + self.height() / 2
+            cx, cy = position.x() + self.win_w / 2, position.y() + self.win_h / 2
             dx, dy = self.target[0] - cx, self.target[1] - cy
             dist = (dx * dx + dy * dy) ** 0.5
             if dist < 12:
@@ -4585,7 +4613,7 @@ class PetWindow(QWidget):
             else:
                 step = self.cur_speed * FRAME_INTERVAL / 1000.0
                 nx, ny = cx + dx / dist * step, cy + dy / dist * step
-                self._move_precise(nx - self.width() / 2, ny - self.height() / 2)
+                self._move_precise(nx - self.win_w / 2, ny - self.win_h / 2)
                 if abs(dx) > abs(dy) * 1.15:
                     self._set_dir("left" if dx < 0 else "right", 1 if dx < 0 else -1)
                 else:
@@ -4659,11 +4687,12 @@ class PetWindow(QWidget):
     def _sync_video(self):
         """更新视频帧在本体中的绘制位置，跟随走路、拖拽和飞行。"""
         if self.video is None or not self.video.clip:
+            self._fit_animation_canvas()
             return
         if not self.isVisible():
             return                    # 本体藏起来了（护眼/显示隐藏）→ 视频也别冒出来
-        cx = self.x() + self.width() / 2
-        bottom = self.y() + BUBBLE_H + MARGIN + self.cur_h
+        cx = self._body_pos().x() + self.win_w / 2
+        bottom = self._body_pos().y() + BUBBLE_H + MARGIN + self.cur_h
         self.video.fit_to(cx, bottom, self.cur_h, mirror=self.facing < 0)
 
     def set_video_anim(self, on):
@@ -4678,6 +4707,7 @@ class PetWindow(QWidget):
         else:
             if self.video is not None:
                 self.video.stop()
+            self._fit_animation_canvas()
             self.say("换回手绘立绘～")
         self.update()
 
@@ -4790,11 +4820,11 @@ class PetWindow(QWidget):
         ny = position.y() + self.vy * time_step
         if nx < geo.left():
             nx, self.vx = geo.left(), -self.vx * 0.55
-        elif nx + self.width() > geo.right():
-            nx, self.vx = geo.right() - self.width(), -self.vx * 0.55
+        elif nx + self.win_w > geo.right():
+            nx, self.vx = geo.right() - self.win_w, -self.vx * 0.55
         if ny < geo.top():
             ny, self.vy = geo.top(), -self.vy * 0.45
-        ground = geo.bottom() - self.height()
+        ground = geo.bottom() - self.win_h
         if ny >= ground:
             ny = ground
             if abs(self.vy) < 2.2:
@@ -4809,7 +4839,7 @@ class PetWindow(QWidget):
                 self._bubble_now("💨", 600)
         self.vx *= 0.995 ** time_step                      # 空气阻力
         self._move_precise(nx, ny)
-        self.cfg["x"], self.cfg["y"] = self.x(), self.y()
+        self.cfg["x"], self.cfg["y"] = self._body_pos().x(), self._body_pos().y()
         self._sync_video()                                # 飞的时候视频也得跟着
 
     def _stop_flying(self):
@@ -5149,7 +5179,7 @@ class PetWindow(QWidget):
         self._said_bye = True
         line = random.choice(BYE_LINES)
         try:
-            self.cfg["x"], self.cfg["y"] = self.x(), self.y()
+            self.cfg["x"], self.cfg["y"] = self._body_pos().x(), self._body_pos().y()
             self.save_config()
         except Exception as e:
             print("关机前保存失败:", e)
@@ -5209,12 +5239,12 @@ class PetWindow(QWidget):
             delta = e.globalPosition().toPoint() - self.drag_start_pos
             if not self.dragging and delta.manhattanLength() > 6:
                 self.dragging = True
-                self.drag_offset = e.globalPosition().toPoint() - QPoint(self.x(), self.y())
+                self.drag_offset = e.globalPosition().toPoint() - QPoint(self._body_pos().x(), self._body_pos().y())
                 if self.video_ready():
                     self.show_clip(self.clip_for("拖拽"), loop=True)   # 悬空反馈动画
             if self.dragging and self.drag_offset is not None:
                 pos = e.globalPosition().toPoint() - self.drag_offset
-                self.move(pos)
+                self._move_body(pos)
                 self.drag_history.append((pos.x(), pos.y(), time.time()))
                 if len(self.drag_history) > 6:
                     self.drag_history.pop(0)
@@ -5245,7 +5275,7 @@ class PetWindow(QWidget):
                     self._video_idle()
                     if random.random() < 0.5:
                         self.say(random.choice(DRAG_LINES))
-                    self.cfg["x"], self.cfg["y"] = self.x(), self.y()
+                    self.cfg["x"], self.cfg["y"] = self._body_pos().x(), self._body_pos().y()
                     self.save_config()
                     self.chat_paused = False
             else:
@@ -5256,7 +5286,7 @@ class PetWindow(QWidget):
     def mouseDoubleClickEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             self._click_timer.stop()
-            self.food_panel.popup_at(self.x() + self.width() / 2, self.y() + BUBBLE_H)
+            self.food_panel.popup_at(self._body_pos().x() + self.win_w / 2, self._body_pos().y() + BUBBLE_H)
 
     def _on_single_click(self):
         """单击：先 Q 弹挤压、再随机回应一个动作，同时回嘴。"""
@@ -5596,7 +5626,8 @@ class PetWindow(QWidget):
         self.prev_key = None
         self.win_mx = int(self.cur_h * 0.062) + 6
         self.win_w = max(p.width() for k, p in self.sprites.items() if k[1] == self.cur_h) + self.win_mx * 2
-        self.setFixedSize(self.win_w, self.cur_h + BUBBLE_H + MARGIN * 2 + 10)
+        self.win_h = self.cur_h + BUBBLE_H + MARGIN * 2 + 10
+        self._sync_video()
         self.snap_into_screen()
         if persist:
             self.cfg["size"] = mult
@@ -5604,9 +5635,9 @@ class PetWindow(QWidget):
 
     def snap_into_screen(self):
         geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
-        x = max(geo.left(), min(geo.right() - self.width(), self.x()))
-        y = max(geo.top(), min(geo.bottom() - self.height(), self.y()))
-        self.move(x, y)
+        x = max(geo.left(), min(geo.right() - self.win_w, self._body_pos().x()))
+        y = max(geo.top(), min(geo.bottom() - self.win_h, self._body_pos().y()))
+        self._move_body(x, y)
 
     def _apply_passthrough(self, on):
         hwnd = int(self.winId())
@@ -5723,7 +5754,7 @@ class PetWindow(QWidget):
             self.raise_()
 
     def quit_app(self):
-        self.cfg["x"], self.cfg["y"] = self.x(), self.y()
+        self.cfg["x"], self.cfg["y"] = self._body_pos().x(), self._body_pos().y()
         self.save_config()
         self.tray.hide()
         QApplication.quit()
