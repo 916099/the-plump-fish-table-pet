@@ -373,8 +373,8 @@ ACTIONS = [
     {"key": "droop",   "name": "垂头叹气",     "cat": "emote", "ticks": 90,  "weight": 3,  "fn": _a_droop, "bubble": "💧"},
     {"key": "squash",  "name": "Q 弹挤压",     "cat": "fun",   "ticks": 30,  "weight": 0,  "fn": _a_squash,
      "menu": False},
-    {"key": "bump",    "name": "撞到边框揉揉头", "cat": "fun", "ticks": 95, "weight": 0,
-     "fn": _a_edge_bump, "bubble": "💫", "menu": False},
+    {"key": "bump",    "name": "撞到边框揉揉头", "cat": "fun", "ticks": 130, "weight": 0,
+     "fn": _a_edge_bump, "menu": False},
 ]
 CATEGORY_NAMES = {"idle": "卖萌", "play": "玩耍", "emote": "情绪", "fun": "搞怪"}
 _ACTION_BY_KEY = {a["key"]: a for a in ACTIONS}
@@ -4071,6 +4071,7 @@ class PetWindow(QWidget):
         self.drag_history = []        # 拖拽轨迹，用来算甩出去的初速度
         self._drag_started_at = 0.0
         self._edge_impact_latched = False
+        self._edge_impact_pending_rest = False
         self._edge_impact_until = 0.0
         self._edge_impact_cooldown_until = 0.0
         self._next_action = None      # 排队的下一个动作（比如点击：先挤压再回应）
@@ -4597,11 +4598,39 @@ class PetWindow(QWidget):
             return False
         self._edge_impact_latched = True
         self._edge_impact_cooldown_until = now + 1.15
-        self._edge_impact_until = now + 1.8
+        self._edge_impact_pending_rest = True
+        self._edge_impact_until = 0.0
         self._drag_content_rect = None
-        self.play_action("bump", force=True, bubble="💫")
-        self._bubble_now("哎哟，撞到边边了！揉揉脑袋……", 1800)
+        self.play_action("bump", force=True)
         return True
+
+    def _start_edge_impact_rest(self):
+        """停止移动后继续揉头两秒；只切动画，不改动原有说话气泡。"""
+        self._edge_impact_pending_rest = False
+        self._edge_impact_until = time.monotonic() + 2.0
+        self._drag_content_rect = None
+        clip = self.clip_for("bump") if self.video_ready() else ""
+        if clip and self.show_clip(clip, loop=True):
+            return True
+        self.play_action("bump", force=True)
+        if self.action == "bump":
+            ticks = max(1, int(round(2000.0 / TICK)))
+            self.action_total = self.action_left = ticks
+            self.action_t = 0.0
+        return True
+
+    def _finish_edge_impact_if_due(self):
+        if not self._edge_impact_until or time.monotonic() < self._edge_impact_until:
+            return
+        self._edge_impact_until = 0.0
+        if self.action == "bump":
+            self.action = None
+            self.action_left = self.action_total = 0
+            self.action_t = 0.0
+            self.update()
+        if (self.video is not None and self.video.clip == ACTION_TO_CLIP.get("bump")
+                and not self.flying and not self.dragging):
+            self._video_idle()
 
     def _keep_scene_on_screen(self):
         left, top, right, bottom = self._scene_body_limits()
@@ -4635,6 +4664,7 @@ class PetWindow(QWidget):
     def tick(self):
         time_step = FRAME_INTERVAL / TICK
         self.t += time_step
+        self._finish_edge_impact_if_due()
 
         # 处理后台线程（DeepSeek 等）排队的气泡消息，Qt 界面必须在主线程更新
         if self._say_queue:
@@ -4887,7 +4917,9 @@ class PetWindow(QWidget):
             return
         if key != "squash" and self.video_ready():
             clip = ACTION_TO_CLIP.get(key, "")
-            if clip and clip in self.anim_names() and self.show_clip(clip, loop=False):
+            loop = key == "bump" and (self._edge_impact_pending_rest or
+                                       self._edge_impact_until > time.monotonic())
+            if clip and clip in self.anim_names() and self.show_clip(clip, loop=loop):
                 self._bubble_now(bubble or a.get("bubble"), 1400)
                 return
         if self.action and not force:
@@ -4903,6 +4935,11 @@ class PetWindow(QWidget):
         self.update()
 
     def _finish_action(self):
+        if self.action == "bump" and self._edge_impact_pending_rest:
+            self.action_total = self.action_left = max(1, int(_ACTION_BY_KEY["bump"]["ticks"]))
+            self.action_t = 0.0
+            self.update()
+            return
         was = self.action
         self.action = None
         self.action_left = 0
@@ -4988,8 +5025,11 @@ class PetWindow(QWidget):
         self.vx = self.vy = 0.0
         self.target = None
         self.rest_until = self.t * TICK + random.randint(4000, 9000)
-        self.play_action("squash", force=True)            # 落地 Q 弹一下
-        self._video_idle()
+        if self._edge_impact_pending_rest:
+            self._start_edge_impact_rest()
+        else:
+            self.play_action("squash", force=True)        # 落地 Q 弹一下
+            self._video_idle()
         if random.random() < 0.45:
             self.say(random.choice(LANDING_LINES))
         self.save_config()
@@ -5383,6 +5423,9 @@ class PetWindow(QWidget):
             if not self.dragging and delta.manhattanLength() > 6:
                 self.dragging = True
                 self._drag_content_rect = None
+                if self._edge_impact_until > time.monotonic():
+                    self._edge_impact_until = 0.0
+                    self._edge_impact_pending_rest = True
                 body_pos = self._body_pos()
                 self.drag_offset = e.globalPosition().toPoint() - QPoint(body_pos.x(), body_pos.y())
                 self.drag_history = [(body_pos.x(), body_pos.y(), self._drag_started_at)]
@@ -5436,7 +5479,10 @@ class PetWindow(QWidget):
                     self._throw(vx, vy)
                 else:                                          # 温柔放下 → 原地停住
                     self._set_dir("down", 1)
-                    if time.monotonic() >= self._edge_impact_until:
+                    if (self._edge_impact_pending_rest or
+                            time.monotonic() < self._edge_impact_until):
+                        self._start_edge_impact_rest()
+                    else:
                         self.play_action("squash", force=True)
                         self._video_idle()
                     if random.random() < 0.5:
