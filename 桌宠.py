@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 大肥鱼桌宠 —— 三视图透明桌宠 + 「分身」AI 助手
-左键单击：蹦跳 + 回嘴 + 弹出 🗨️，点它打开唯一的「分身」窗口（对话 / 干活 / 看网页都在这儿）
+左键单击：蹦跳 + 回嘴；右键菜单打开「分身」窗口（对话 / 干活 / 看网页都在这儿）
 双击：喂食面板；右键：完整菜单
 """
 import base64
@@ -1741,52 +1741,6 @@ def tool_fetch_url(url):
     except Exception as e:
         return json.dumps({"error": "打不开这个链接：%s" % e}, ensure_ascii=False)
 
-
-class FunctionPanel(QFrame):
-    """左键弹出的功能列表 - 白底矩形，只有一个🗨️图标"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        _t = _theme()
-        self.setStyleSheet(
-            "QFrame{background:%s;border-radius:14px;border:1px solid %s;}"
-            % (_t["panel_light"], _t["panel_border"]) + """
-            QPushButton {
-                background: transparent;
-                border: none;
-                font-size: 28px;
-                padding: 10px 16px;
-                border-radius: 10px;
-            }
-            QPushButton:hover {
-                background: rgba(0,0,0,0.04);
-            }
-            QPushButton:pressed {
-                background: rgba(0,0,0,0.08);
-            }
-        """)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(0)
-        
-        self.chat_btn = QPushButton("🗨️")
-        self.chat_btn.setFixedSize(52, 48)
-        self.chat_btn.clicked.connect(self._on_chat_clicked)
-        layout.addWidget(self.chat_btn)
-        
-        self.setFixedSize(68, 60)
-        self.hide()
-    
-    def _on_chat_clicked(self):
-        self.hide()
-        if self.parent():
-            self.parent().open_avatar()
-    
-    def popup_at(self, x, y):
-        self.move(int(x), int(y))
-        self.show()
-        self.raise_()
 
 class FoodPanel(QWidget):
     """双击弹出的喂食面板"""
@@ -3904,10 +3858,8 @@ class PetWindow(QWidget):
         _BROWSER_FETCH["fn"] = self._fetch_by_browser
         _LOGIN_HOOK["fn"] = self._open_login_for
         
-        # 功能列表
-        self.function_panel = FunctionPanel(self)
         self.food_panel = FoodPanel(self.on_food)
-        # 单击延迟判定（等双击）：单击=回嘴+弹聊天面板，双击=喂食
+        # 单击延迟判定（等双击）：单击=回嘴，双击=喂食
         self._click_timer = QTimer(self)
         self._click_timer.setSingleShot(True)
         self._click_timer.timeout.connect(self._on_single_click)
@@ -4965,7 +4917,6 @@ class PetWindow(QWidget):
             self.drag_start_pos = e.globalPosition().toPoint()
             self.drag_history = []
             self.flying = False          # 抓住就不飞了
-            self.function_panel.hide()
             self.chat_paused = True
 
     def mouseMoveEvent(self, e):
@@ -5013,7 +4964,7 @@ class PetWindow(QWidget):
                     self.save_config()
                     self.chat_paused = False
             else:
-                self._click_timer.start(280)  # 等双击判定；单击则回嘴+弹聊天面板
+                self._click_timer.start(280)  # 等双击判定；单击则回嘴
             self.last_press_pos = None
             self.drag_start_pos = None
 
@@ -5023,16 +4974,13 @@ class PetWindow(QWidget):
             self.food_panel.popup_at(self.x() + self.width() / 2, self.y() + BUBBLE_H)
 
     def _on_single_click(self):
-        """单击：先 Q 弹挤压、再随机回应一个动作，同时回嘴 + 弹功能面板"""
+        """单击：先 Q 弹挤压、再随机回应一个动作，同时回嘴。"""
         key = random.choice(CLICK_ACTIONS)
         self.play_action("squash", force=True)
         self._next_action = key
         self.jump_t = 0.6
         if random.random() < 0.6:
             self.say(random.choice(REACT_LINES))
-        panel = self.function_panel
-        panel.popup_at(self.x() + self.width() / 2 - panel.width() / 2,
-                       self.y() - panel.height() - 10)
 
     def on_food(self, food):
         self.food_panel.hide()
