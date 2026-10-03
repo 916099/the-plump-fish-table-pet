@@ -2241,6 +2241,11 @@ def _remove_dwm_border(widget):
         dwm.DwmSetWindowAttribute.argtypes = (
             ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint)
         dwm.DwmSetWindowAttribute.restype = ctypes.c_long
+        alpha = ctypes.c_int(1)
+        alpha_result = dwm.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd), 39, ctypes.byref(alpha), ctypes.sizeof(alpha))
+        if alpha_result != 0:
+            print("启用窗口透明通道失败: HRESULT 0x%08X" % (alpha_result & 0xFFFFFFFF))
         color = ctypes.c_uint32(0xFFFFFFFE)   # DWMWA_COLOR_NONE
         result = dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 34, ctypes.byref(color),
                                            ctypes.sizeof(color))  # DWMWA_BORDER_COLOR
