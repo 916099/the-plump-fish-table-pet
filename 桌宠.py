@@ -342,15 +342,17 @@ def _a_squash(p, k):
 
 
 def _a_edge_bump(p, k):
-    """撞到屏幕边缘后先一缩，再晃晃脑袋缓一缓。"""
+    """撞边后先一缩，然后揉头并带动全身快速颤抖，不做左右扭腰。"""
     impact = max(0.0, 1.0 - k * 5.0)
     rub = max(0.0, min(1.0, (k - 0.18) / 0.82))
-    tremor = math.sin(rub * math.pi * 10.0) * math.sin(rub * math.pi)
+    phase = rub * math.pi * 18.0
+    envelope = math.sin(rub * math.pi)
     return {
-        "rot": 8.0 * impact + 3.0 * tremor,
+        "rot": 0.0,
         "sx": -0.035 * impact,
         "sy": -0.075 * impact,
-        "dy": 2.0 * impact + 1.5 * abs(tremor),
+        "dx": 3.0 * math.sin(phase) * envelope,
+        "dy": 2.0 * impact + 3.0 * math.cos(phase) * envelope,
     }
 
 
@@ -4073,6 +4075,8 @@ class PetWindow(QWidget):
         self._edge_impact_latched = False
         self._edge_impact_pending_rest = False
         self._edge_impact_until = 0.0
+        self._edge_impact_post_landing = False
+        self._edge_impact_pause_until = 0.0
         self._edge_impact_cooldown_until = 0.0
         self._next_action = None      # 排队的下一个动作（比如点击：先挤压再回应）
         # 视频动画（106 个透明 webm，见 anim/）
@@ -4322,6 +4326,10 @@ class PetWindow(QWidget):
     def paintEvent(self, _):
         dpr = self.devicePixelRatioF()
         now = self.t * TICK / 1000.0
+        shake_now = time.monotonic()
+        shivering = (self._edge_impact_pending_rest or
+                     shake_now < self._edge_impact_until)
+        shake_frame = int(shake_now * 60) if shivering else None
         video = self.video
         cache_key = None
         if video is not None and video.frame_ready and video.frame_image is not None:
@@ -4329,7 +4337,8 @@ class PetWindow(QWidget):
             cache_key = (video.frame_image.cacheKey(), r.x(), r.y(), r.width(), r.height(),
                          video.mirror, self.width(), self.height(), dpr,
                          self.bubble_text if now < self.bubble_until else "",
-                         self.bubble_inner, self.bubble_font.toString(), self.cfg.get("theme"))
+                         self.bubble_inner, self.bubble_font.toString(), self.cfg.get("theme"),
+                         shake_frame)
             if cache_key == getattr(self, "_video_paint_key", None):
                 self._present_pet_frame(self._video_paint_image, None)
                 return
@@ -4385,6 +4394,8 @@ class PetWindow(QWidget):
         else:
             sway = math.sin(now * 2.5) * 1.5
             bob = 0.0
+        if self.action == "bump":
+            sway = 0.0
         breath = 1.0 + 0.02 * math.sin(now * 2.5)
         scale = breath
         jump = -abs(math.sin(self.jump_t * 3.14159)) * 14 * self.jump_t if self.jump_t > 0 else 0
@@ -4446,6 +4457,9 @@ class PetWindow(QWidget):
                 p.translate(rect.center().x(), 0)
                 p.scale(-1, 1)
                 p.translate(-rect.center().x(), 0)
+            if shivering:
+                phase = shake_now * math.pi * 12.0
+                p.translate(3.0 * math.sin(phase), 2.4 * math.sin(phase * 1.31))
             p.drawImage(frame_rect, frame)
             p.restore()
             self._video_paint_key = cache_key
@@ -4600,6 +4614,9 @@ class PetWindow(QWidget):
         self._edge_impact_cooldown_until = now + 1.15
         self._edge_impact_pending_rest = True
         self._edge_impact_until = 0.0
+        self._edge_impact_post_landing = False
+        self._edge_impact_pause_until = 0.0
+        self._next_action = None
         self._drag_content_rect = None
         self.play_action("bump", force=True)
         return True
@@ -4620,24 +4637,46 @@ class PetWindow(QWidget):
         return True
 
     def _finish_edge_impact_if_due(self):
-        if not self._edge_impact_until or time.monotonic() < self._edge_impact_until:
-            return
-        self._edge_impact_until = 0.0
-        bump_clip = ACTION_TO_CLIP.get("bump")
-        resume_original_flow = (self.action == "bump" or
-                                (self.video is not None and self.video.clip == bump_clip))
-        if not resume_original_flow:
-            return
-        if self.action == "bump":
-            self.action = None
-            self.action_left = self.action_total = 0
-            self.action_t = 0.0
+        now = time.monotonic()
+        if self._edge_impact_until and now >= self._edge_impact_until:
+            self._edge_impact_until = 0.0
+            bump_clip = ACTION_TO_CLIP.get("bump")
+            resume_original_flow = (self.action == "bump" or
+                                    (self.video is not None and self.video.clip == bump_clip))
+            if resume_original_flow:
+                if self.action == "bump":
+                    self.action = None
+                    self.action_left = self.action_total = 0
+                    self.action_t = 0.0
+                self._next_action = None
+                self.target = None
+                self.cur_speed = 0.0
+                self._edge_impact_post_landing = True
+                squash_clip = self.clip_for("squash") if self.video_ready() else ""
+                if squash_clip and self.show_clip(squash_clip, loop=False):
+                    self.update()
+                    return
+                if self.video is not None and self.video.clip:
+                    self.video.stop()
+                self.play_action("squash", force=True)
+                self.update()
+                return
+        if self._edge_impact_pause_until and now >= self._edge_impact_pause_until:
+            self._edge_impact_pause_until = 0.0
+            self.rest_until = self.t * TICK
+            self.target = None
+            if (self.video is not None and
+                    self.video.clip == ACTION_TO_CLIP.get("squash")):
+                self._video_idle()
+            self.update()
+
+    def _start_edge_impact_pause(self):
+        """落地收尾结束后停住三秒，再交回待机/移动逻辑。"""
+        self._edge_impact_post_landing = False
+        self._edge_impact_pause_until = time.monotonic() + 3.0
         self.target = None
-        self.rest_until = self.t * TICK
-        self.play_action("squash", force=True)
-        if (self.video is not None and self.video.clip == bump_clip
-                and not self.flying and not self.dragging):
-            self._video_idle()
+        self.cur_speed = 0.0
+        self.rest_until = self.t * TICK + 3000
         self.update()
 
     def _keep_scene_on_screen(self):
@@ -4724,6 +4763,13 @@ class PetWindow(QWidget):
             return
 
         self._sync_video()            # 视频窗跟着本体走
+
+        # 落地收尾和收尾后的三秒停顿期间，不生成移动目标或随机动作。
+        if self._edge_impact_post_landing or self._edge_impact_pause_until:
+            self.target = None
+            self.cur_speed = 0.0
+            self.update()
+            return
         
         if self.chat_paused:
             self.update()
@@ -4822,6 +4868,15 @@ class PetWindow(QWidget):
     def _on_clip_end(self, clip):
         """一段演完 → 接回待机循环（和 dsh-pet 的动画链一个意思）"""
         if self.video is not None and self.video.clip and not self.flying:
+            # 切到落地收尾后，旧揉头片段可能才送达结束信号；忽略过期信号。
+            if clip != self.video.clip:
+                return
+            if clip == ACTION_TO_CLIP.get("squash") and self._edge_impact_post_landing:
+                self._start_edge_impact_pause()
+                return
+            if (clip == ACTION_TO_CLIP.get("squash") and
+                    self._edge_impact_pause_until > time.monotonic()):
+                return
             if self.dragging:
                 self._drag_content_rect = None
                 drag = self.clip_for("拖拽")
@@ -4954,6 +5009,10 @@ class PetWindow(QWidget):
         self.action_total = 0
         self.action_t = 0.0
         self.update()
+        if was == "squash" and self._edge_impact_post_landing:
+            self._next_action = None
+            self._start_edge_impact_pause()
+            return
         nxt = self._next_action                          # 排队的优先
         self._next_action = None
         if nxt:
@@ -5431,6 +5490,9 @@ class PetWindow(QWidget):
             if not self.dragging and delta.manhattanLength() > 6:
                 self.dragging = True
                 self._drag_content_rect = None
+                if self._edge_impact_post_landing or self._edge_impact_pause_until:
+                    self._edge_impact_post_landing = False
+                    self._edge_impact_pause_until = 0.0
                 if self._edge_impact_until > time.monotonic():
                     self._edge_impact_until = 0.0
                     self._edge_impact_pending_rest = True
