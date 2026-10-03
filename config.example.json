@@ -1,0 +1,78 @@
+{
+  "_README": [
+    "这是大肥鱼桌宠的【配置模板】。它里面没有任何人的真实信息，可以安全地跟着代码一起开源。",
+    "",
+    "★ 这个文件默认不在程序目录里，而是在你自己的 Windows 账户下：",
+    "     %APPDATA%\\dafeiyu-pet\\config.json",
+    "   想看确切路径：右键桌宠 →「我的配置存在哪？（看路径）」。",
+    "   想让配置跟着程序文件夹走（U 盘随身带）：在程序目录放一个空的 portable.txt 即可。",
+    "",
+    "★ API Key 不在这里保存！",
+    "   Key 单独用 Windows DPAPI 加密后存在同目录的 key.bin 里，换台电脑/换个 Windows",
+    "   账户都解不开。config.json 里的 ds_api_key 永远写空字符串。",
+    "   想设置 Key：右键桌宠 →「设置 Key」。",
+    "   （如果你手填 ds_api_key，程序也会自动把它加密收进 key.bin，再把这里抹掉。）",
+    "",
+    "怎么用（两种都行）：",
+    "  1) 直接启动桌宠 → 右键「设置 Key（还没填 ← 点这里）」填进去 —— 立刻生效，不用重启。",
+    "  2) 把本文件复制到上面那个 %APPDATA% 目录并改名 config.json，再改下面的值。",
+    "",
+    "⚠ 下面几项是【个人隐私】，只存在你自己的账户下，别提交到 git：",
+    "  ds_base_url       —— 只有用中转/自建服务时才改；默认官方地址",
+    "  city / lat / lon  —— 你的城市和坐标（开了 auto_locate_city 会自动用 IP 填上）",
+    "  proxy / proxy_list—— 你的本地代理端口（没有就留空）",
+    "  x / y             —— 桌宠上次停在屏幕的哪个位置（留 null 让它自己找地方）",
+    "  chrome_search_dirs—— 找不到浏览器时才需要填的扫描目录（留空=不扫描你的硬盘）",
+    "",
+    "config.json 和 key.bin 都在 .gitignore 里，正常的 git 提交不会把它们传上去。"
+  ],
+
+  "mode": "wander",
+  "size": 0.9,
+  "topmost": true,
+  "passthrough": false,
+  "autostart": false,
+
+  "x": null,
+  "y": null,
+
+  "ds_api_key": "我的API key 填充sk……",
+  "key_storage": "none",
+  "ds_base_url": "https://api.deepseek.com/v1",
+  "ds_model": "deepseek-chat",
+
+  "eye_rest_enabled": true,
+  "eye_rest_interval_min": 120,
+  "eye_rest_duration_min": 10,
+  "eye_rest_shrink": true,
+  "eye_rest_minimize_windows": true,
+  "eye_rest_restore_windows": true,
+  "eye_rest_overlay": true,
+  "eye_rest_pending": [],
+  "eye_rest_restore_at": 0,
+
+  "task_model": "",
+  "task_max_rounds": 4,
+
+  "proxy": "",
+  "proxy_list": [],
+
+  "search_provider": "both",
+  "search_engine": "ddg",
+  "browser_search": true,
+  "login_wait_sec": 180,
+
+  "video_anim": true,
+  "theme": "pink",
+
+  "chrome_path": "",
+  "chrome_search_dirs": [],
+  "chrome_scan_depth": 3,
+  "webengine_no_sandbox": true,
+
+  "city": "你的城市，例如：北京",
+  "lat": null,
+  "lon": null,
+  "loc_src": "",
+  "auto_locate_city": true
+}
