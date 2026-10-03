@@ -281,7 +281,10 @@ def _a_turn(p, k):
 
 def _a_spin(p, k):
     """原地 360 度旋转展示：绕身体中心转，同时缩一点，免得转出窗口被裁掉"""
-    return {"rot": 360 * k, "pivot": "center", "sx": -0.22, "sy": -0.22,
+    eased = k * k * (3.0 - 2.0 * k)
+    squeeze = math.sin(k * math.pi)
+    return {"rot": 360 * eased, "pivot": "center",
+            "sx": -0.22 * squeeze, "sy": -0.22 * squeeze,
             "dy": -2 * math.sin(k * math.pi)}
 
 
@@ -345,7 +348,7 @@ def _a_edge_bump(p, k):
     """撞边后先一缩，然后揉头并带动全身快速颤抖，不做左右扭腰。"""
     impact = max(0.0, 1.0 - k * 5.0)
     rub = max(0.0, min(1.0, (k - 0.18) / 0.82))
-    phase = rub * math.pi * 18.0
+    phase = rub * math.pi * 10.0
     envelope = math.sin(rub * math.pi)
     return {
         "rot": 0.0,
@@ -387,6 +390,7 @@ CLICK_BUBBLES = {"happy": "♪", "shy": "😳", "puff": "💢", "tickle": "😆"
 LANDING_LINES = ["啪叽——", "落地！", "……晕了。", "再扔一次嘛～"]
 FLY_LINES = ["飞起来啦——", "哇啊啊——", "我会飞！"]
 EDGE_IMPACT_SPEED = 460.0  # px/s：仅快速碰边时触发撞击反馈
+EDGE_IMPACT_SHAKE_SECONDS = 1.0
 
 EYE_REST_LINES = [
     "盯着屏幕两小时啦！快看看远处，眼睛要坏的！",
@@ -4061,6 +4065,7 @@ class PetWindow(QWidget):
         self.target = None
         self.rest_until = 0
         self.cur_speed = 0.0
+        self._walk_pose_blend = 0.0
         self.prev_key = None
         self.cross_t = 0.0
         self.action = None
@@ -4082,6 +4087,9 @@ class PetWindow(QWidget):
         self._action_cooldown_until = 0.0
         # 视频动画（106 个透明 webm，见 anim/）
         self.video = None
+        self._video_transition_clip = None
+        self._video_fade_started = None
+        self._video_transition_from_image = None
         self._anim_set = None
         self._video_failed = False
         self._locate_queue = None
@@ -4333,13 +4341,27 @@ class PetWindow(QWidget):
         shake_frame = int(shake_now * 60) if shivering else None
         video = self.video
         cache_key = None
+        video_transition_alpha = 1.0
+        video_transition_frame = None
         if video is not None and video.frame_ready and video.frame_image is not None:
+            if self._video_transition_clip == video.clip:
+                if self._video_fade_started is None:
+                    self._video_fade_started = shake_now
+                fade_progress = min(1.0, max(
+                    0.0, (shake_now - self._video_fade_started) / 0.18))
+                video_transition_alpha = fade_progress * fade_progress * (3.0 - 2.0 * fade_progress)
+                if fade_progress < 1.0:
+                    video_transition_frame = int(fade_progress * 60)
+                else:
+                    self._video_transition_clip = None
+                    self._video_fade_started = None
+                    self._video_transition_from_image = None
             r = video.render_rect
             cache_key = (video.frame_image.cacheKey(), r.x(), r.y(), r.width(), r.height(),
                          video.mirror, self.width(), self.height(), dpr,
                          self.bubble_text if now < self.bubble_until else "",
                          self.bubble_inner, self.bubble_font.toString(), self.cfg.get("theme"),
-                         shake_frame)
+                         shake_frame, video_transition_frame)
             if cache_key == getattr(self, "_video_paint_key", None):
                 self._present_pet_frame(self._video_paint_image, None)
                 return
@@ -4388,28 +4410,36 @@ class PetWindow(QWidget):
                            Qt.AlignmentFlag.AlignCenter, l)
 
         cx = self._canvas_offset.x() + self.win_w / 2
-        walking = self.target is not None and not self.dragging and not self.flying
-        if walking:
-            sway = math.sin(now * 9.0) * 3.5
-            bob = -abs(math.sin(now * 4.5)) * 7.0
-        else:
-            sway = math.sin(now * 2.5) * 1.5
-            bob = 0.0
-        if self.action == "bump":
-            sway = 0.0
-        breath = 1.0 + 0.02 * math.sin(now * 2.5)
-        scale = breath
-        jump = -abs(math.sin(self.jump_t * 3.14159)) * 14 * self.jump_t if self.jump_t > 0 else 0
+        walk_blend = self._walk_pose_blend
+        scale = 1.0
+        jump = (-abs(math.sin(self.jump_t * 3.14159)) * 14 * self.jump_t
+                if self.jump_t > 0 and not self.action else 0)
         # 动作表给的变换（动作名 → 每帧函数）
         act = {"rot": 0.0, "sx": 0.0, "sy": 0.0, "dx": 0.0, "dy": 0.0,
                "alpha": 1.0, "sprite": None, "facing": None, "pivot": "bottom"}
+        base_key = self._sprite_key()
+        action_blend = 1.0
         if self.action:
             a = _ACTION_BY_KEY.get(self.action)
             if a:
                 try:
-                    act.update(a["fn"](self, self._action_progress()) or {})
+                    progress = self._action_progress()
+                    act.update(a["fn"](self, progress) or {})
+                    fade_in = min(1.0, max(0.0, progress / 0.12))
+                    fade_out = min(1.0, max(0.0, (1.0 - progress) / 0.18))
+                    fade_in = fade_in * fade_in * (3.0 - 2.0 * fade_in)
+                    fade_out = fade_out * fade_out * (3.0 - 2.0 * fade_out)
+                    action_blend = min(fade_in, fade_out)
                 except Exception as e:
                     print("动作绘制出错(%s): %s" % (self.action, e))
+        for key in ("rot", "sx", "sy", "dx", "dy"):
+            if not (self.action == "spin" and key == "rot"):
+                act[key] *= action_blend
+        act["alpha"] = 1.0 + (act["alpha"] - 1.0) * action_blend
+        if self.action:
+            walk_blend *= 1.0 - action_blend
+        sway = math.sin(now * 9.0) * 3.5 * walk_blend
+        bob = -abs(math.sin(now * 4.5)) * 7.0 * walk_blend
         if self.flying:               # 被甩飞时按速度倾斜、拉长一点
             act["rot"] = act["rot"] + max(-22.0, min(22.0, self.vx * 1.6))
             act["sy"] = act["sy"] + min(0.10, abs(self.vy) * 0.004)
@@ -4442,6 +4472,14 @@ class PetWindow(QWidget):
             p.restore()
 
         cur_key = self._sprite_key(act.get("sprite"), act.get("facing"))
+        action_pose_override = (bool(self.action) and
+                                (act.get("sprite") is not None or
+                                 act.get("facing") is not None) and
+                                cur_key != base_key and action_blend < 1.0)
+        transition_has_previous = (
+            self.video is not None and
+            self._video_transition_clip == self.video.clip and
+            self._video_transition_from_image is not None)
         if self.video is not None and self.video.frame_ready and self.video.frame_image is not None:
             # 在本体窗口绘制真实透明视频帧，鼠标直接命中角色，不再叠放浏览器窗口。
             rect = QRectF(self.video.render_rect)
@@ -4454,24 +4492,43 @@ class PetWindow(QWidget):
                     # 拖动时把裁出的角色固定在首帧位置和大小，消除“越拖越缩”的错觉。
                     frame_rect = QRectF(self._drag_content_rect)
             p.save()
+            if transition_has_previous and video_transition_alpha < 1.0:
+                p.setOpacity(1.0 - video_transition_alpha)
+                p.drawImage(QRectF(0, 0, self.width(), self.height()),
+                            self._video_transition_from_image)
+                p.setOpacity(1.0)
             if self.video.mirror:
                 p.translate(rect.center().x(), 0)
                 p.scale(-1, 1)
                 p.translate(-rect.center().x(), 0)
             if shivering:
-                phase = shake_now * math.pi * 12.0
-                p.translate(3.0 * math.sin(phase), 2.4 * math.sin(phase * 1.31))
+                phase = shake_now * math.pi * 8.0
+                p.translate(2.2 * math.sin(phase), 1.6 * math.sin(phase * 1.31))
+            if video_transition_alpha < 1.0:
+                p.setOpacity(video_transition_alpha)
             p.drawImage(frame_rect, frame)
             p.restore()
             self._video_paint_key = cache_key
             self._video_paint_image = image
             self._present_pet_frame(image, p)
             return
-        if self.cross_t > 0:
-            draw_one(self.prev_key, self.cross_t)
-            draw_one(cur_key, 1.0 - self.cross_t)
+        if transition_has_previous:
+            p.drawImage(QRectF(0, 0, self.width(), self.height()),
+                        self._video_transition_from_image)
         else:
-            draw_one(cur_key, 1.0)
+            if self.cross_t > 0:
+                draw_one(self.prev_key, self.cross_t)
+                rest = 1.0 - self.cross_t
+                if action_pose_override:
+                    draw_one(base_key, rest * (1.0 - action_blend))
+                    draw_one(cur_key, rest * action_blend)
+                else:
+                    draw_one(cur_key, rest)
+            elif action_pose_override:
+                draw_one(base_key, 1.0 - action_blend)
+                draw_one(cur_key, action_blend)
+            else:
+                draw_one(cur_key, 1.0)
         self._video_paint_key = None
         self._present_pet_frame(image, p)
 
@@ -4623,16 +4680,16 @@ class PetWindow(QWidget):
         return True
 
     def _start_edge_impact_rest(self):
-        """停止移动后继续揉头两秒；只切动画，不改动原有说话气泡。"""
+        """停止移动后再揉头一秒；只切动画，不改动原有说话气泡。"""
         self._edge_impact_pending_rest = False
-        self._edge_impact_until = time.monotonic() + 2.0
+        self._edge_impact_until = time.monotonic() + EDGE_IMPACT_SHAKE_SECONDS
         self._drag_content_rect = None
         clip = self.clip_for("bump") if self.video_ready() else ""
         if clip and self.show_clip(clip, loop=True):
             return True
         self.play_action("bump", force=True)
         if self.action == "bump":
-            ticks = max(1, int(round(2000.0 / TICK)))
+            ticks = max(1, int(round(1000.0 * EDGE_IMPACT_SHAKE_SECONDS / TICK)))
             self.action_total = self.action_left = ticks
             self.action_t = 0.0
         return True
@@ -4715,6 +4772,12 @@ class PetWindow(QWidget):
     def tick(self):
         time_step = FRAME_INTERVAL / TICK
         self.t += time_step
+        walk_target = (self.target is not None and not self.dragging and
+                       not self.flying and not self.chat_paused and
+                       self.mode in ("wander", "follow"))
+        walk_blend_step = min(1.0, FRAME_INTERVAL / 100.0)
+        self._walk_pose_blend += (
+            (1.0 if walk_target else 0.0) - self._walk_pose_blend) * walk_blend_step
         self._finish_edge_impact_if_due()
 
         # 处理后台线程（DeepSeek 等）排队的气泡消息，Qt 界面必须在主线程更新
@@ -4864,6 +4927,11 @@ class PetWindow(QWidget):
         if not self.video.ensure():
             self._video_failed = True
             return False
+        if self.video.clip != clip:
+            previous = getattr(self, "_video_paint_image", None)
+            self._video_transition_from_image = previous.copy() if previous is not None else None
+            self._video_transition_clip = clip
+            self._video_fade_started = None
         ok = self.video.play(clip, loop=loop)
         self._sync_video()
         self.update()
@@ -4885,7 +4953,7 @@ class PetWindow(QWidget):
                 self._drag_content_rect = None
                 drag = self.clip_for("拖拽")
                 if drag:
-                    self.video.play(drag, loop=True)
+                    self.show_clip(drag, loop=True)
                     return
             if self._next_action:
                 nxt = self._next_action
@@ -4896,7 +4964,7 @@ class PetWindow(QWidget):
                 self._action_cooldown_until, time.monotonic() + 5.0)
             idle = self.clip_for("待机")
             if idle:
-                self.video.play(idle, loop=True)
+                self.show_clip(idle, loop=True)
 
     def _video_idle(self):
         """没动作时就循环待机动画"""
@@ -4944,6 +5012,10 @@ class PetWindow(QWidget):
         else:
             if self.video is not None:
                 self.video.stop()
+            self._video_transition_clip = None
+            self._video_fade_started = None
+            self._video_transition_from_image = None
+            self._video_paint_image = None
             self._fit_animation_canvas()
             self.say("换回手绘立绘～")
         self.update()
