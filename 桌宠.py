@@ -185,7 +185,7 @@ MARGIN = 4
 SIZE_LEVELS = {"小": 0.55, "中": 0.7, "大": 0.9}
 SPEED = 380.0
 TICK = 20
-FRAME_INTERVAL = 16                  # 约 60 Hz；逻辑时间和速度仍以原来的 20 ms 为基准
+FRAME_INTERVAL = 8                   # 约 120 Hz；逻辑时间和速度仍以原来的 20 ms 为基准
 
 LINES = [
     "梁白开，更适合国人的大硬鲸模型",
@@ -4473,6 +4473,17 @@ class PetWindow(QWidget):
             self.facing = facing
 
     # ---------- 逻辑 ----------
+    def _movement_position(self):
+        # QWidget 位置是整数；保留小数余量，避免高刷新率下左右速度不一致。
+        if getattr(self, "_movement_widget_pos", None) != self.pos():
+            self._movement_float_pos = QPointF(self.pos())
+        return self._movement_float_pos
+
+    def _move_precise(self, x, y):
+        self._movement_float_pos = QPointF(x, y)
+        self.move(round(x), round(y))
+        self._movement_widget_pos = self.pos()
+
     def tick(self):
         time_step = FRAME_INTERVAL / TICK
         self.t += time_step
@@ -4563,7 +4574,8 @@ class PetWindow(QWidget):
             return
 
         if self.target is not None:
-            cx, cy = self.x() + self.width() / 2, self.y() + self.height() / 2
+            position = self._movement_position()
+            cx, cy = position.x() + self.width() / 2, position.y() + self.height() / 2
             dx, dy = self.target[0] - cx, self.target[1] - cy
             dist = (dx * dx + dy * dy) ** 0.5
             if dist < 12:
@@ -4573,7 +4585,7 @@ class PetWindow(QWidget):
             else:
                 step = self.cur_speed * FRAME_INTERVAL / 1000.0
                 nx, ny = cx + dx / dist * step, cy + dy / dist * step
-                self.move(int(nx - self.width() / 2), int(ny - self.height() / 2))
+                self._move_precise(nx - self.width() / 2, ny - self.height() / 2)
                 if abs(dx) > abs(dy) * 1.15:
                     self._set_dir("left" if dx < 0 else "right", 1 if dx < 0 else -1)
                 else:
@@ -4773,8 +4785,9 @@ class PetWindow(QWidget):
         geo = screen.availableGeometry()
         time_step = FRAME_INTERVAL / TICK
         self.vy += 1.15 * time_step                        # 重力
-        nx = self.x() + self.vx * time_step
-        ny = self.y() + self.vy * time_step
+        position = self._movement_position()
+        nx = position.x() + self.vx * time_step
+        ny = position.y() + self.vy * time_step
         if nx < geo.left():
             nx, self.vx = geo.left(), -self.vx * 0.55
         elif nx + self.width() > geo.right():
@@ -4795,7 +4808,7 @@ class PetWindow(QWidget):
                 self.vx *= 0.82
                 self._bubble_now("💨", 600)
         self.vx *= 0.995 ** time_step                      # 空气阻力
-        self.move(int(nx), int(ny))
+        self._move_precise(nx, ny)
         self.cfg["x"], self.cfg["y"] = self.x(), self.y()
         self._sync_video()                                # 飞的时候视频也得跟着
 
