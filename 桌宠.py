@@ -56,7 +56,7 @@ except Exception as _web_err:
     QWebEngineView = QWebEngineProfile = QWebEnginePage = QWebEngineSettings = None
     WEBENGINE_OK = False
     print("内嵌浏览器不可用:", _web_err)
-from PySide6.QtGui import (QPainter, QPixmap, QFont, QColor, QIcon, QFontMetrics,
+from PySide6.QtGui import (QPainter, QPixmap, QImage, QBitmap, QRegion, QFont, QColor, QIcon, QFontMetrics,
                            QPolygonF, QTextDocument, QTextCursor, QShortcut, QKeySequence,
                            QPalette)
 from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
@@ -2228,33 +2228,6 @@ def scan_anims():
         return set()
 
 
-def _remove_dwm_border(widget):
-    """隐藏 Windows 11 DWM 给透明无边框窗口补上的外框。"""
-    if os.name != "nt":
-        return
-    try:
-        hwnd = int(widget.winId())
-        if getattr(widget, "_dwm_border_attempted_hwnd", None) == hwnd:
-            return
-        widget._dwm_border_attempted_hwnd = hwnd
-        dwm = ctypes.windll.dwmapi
-        dwm.DwmSetWindowAttribute.argtypes = (
-            ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint)
-        dwm.DwmSetWindowAttribute.restype = ctypes.c_long
-        alpha = ctypes.c_int(1)
-        alpha_result = dwm.DwmSetWindowAttribute(
-            ctypes.c_void_p(hwnd), 39, ctypes.byref(alpha), ctypes.sizeof(alpha))
-        if alpha_result != 0:
-            print("启用窗口透明通道失败: HRESULT 0x%08X" % (alpha_result & 0xFFFFFFFF))
-        color = ctypes.c_uint32(0xFFFFFFFE)   # DWMWA_COLOR_NONE
-        result = dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 34, ctypes.byref(color),
-                                           ctypes.sizeof(color))  # DWMWA_BORDER_COLOR
-        if result != 0:
-            print("隐藏 DWM 窗口边框失败: HRESULT 0x%08X" % (result & 0xFFFFFFFF))
-    except Exception as e:
-        print("隐藏桌宠窗口边框失败:", e)
-
-
 _VIDEO_SERVER = {"port": 0, "srv": None}
 
 
@@ -2354,8 +2327,15 @@ def start_anim_server():
 
 VIDEO_INFO_JS = ("JSON.stringify((function(){var v=document.querySelector('video');"
                  "if(!v) return null;"
+                 "var frame='';if(v.readyState>=2&&v.videoWidth){"
+                 "var c=window.__frameCanvas||(window.__frameCanvas=document.createElement('canvas'));"
+                 "if(c.width!==v.videoWidth)c.width=v.videoWidth;"
+                 "if(c.height!==v.videoHeight)c.height=v.videoHeight;"
+                 "var g=c.getContext('2d');g.clearRect(0,0,c.width,c.height);g.drawImage(v,0,0);"
+                 "frame=c.toDataURL('image/png').split(',')[1];}"
                  "return {w:v.videoWidth,h:v.videoHeight,t:v.currentTime,dur:v.duration||0,"
                  "ended:!!v.ended,err:(window.__st&&window.__st.err)||'',"
+                 "name:(window.__st&&window.__st.name)||'',frame:frame,"
                  "frameReady:!!(window.__st&&window.__st.frameReady),readyState:v.readyState};})())")
 VIDEO_MEASURE_JS = (
     "(function(){try{var v=document.querySelector('video');"
@@ -3438,29 +3418,23 @@ class EyeRestOverlay(QWidget):
 
 
 class VideoBody(QWidget):
-    """视频动画身体：一块透明置顶小窗，里面用内嵌 Chromium 播 VP9-alpha 的 webm。
-
-    和 dsh-pet 桌面端同一路子（透明小窗 + <video>）。播放期间桌宠本体不画立绘，
-    由它顶着；窗口在系统层面**点击穿透**，所以鱼身上的点击/拖拽仍然落在桌宠上。
-    """
+    """隐藏的 WebM 解码器：将透明视频帧交给桌宠本体绘制，不显示浏览器窗口。"""
 
     def __init__(self, on_clip_end=None, parent=None):
-        super().__init__(None, Qt.WindowType.FramelessWindowHint
-                         | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
-                         | Qt.WindowType.NoDropShadowWindowHint)
+        super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setWindowTitle("大肥鱼（视频）")
         self.on_clip_end = on_clip_end
-        self.target_pet = None           # 鼠标事件转发给谁（桌宠本体）
-        self._grab = False
-        self._filters = []
+        self.target_pet = None           # 收到新的视频帧时重绘桌宠本体
         self.view = None
         self.profile = None
         self.ready = False
         self.page_loaded = False
         self.pending_clip = None
         self.frame_ready = False
+        self.frame_image = None
+        self._poll_pending = False
         self.clip = ""
         self.loaded_clip = ""
         self.loop = True
@@ -3473,7 +3447,7 @@ class VideoBody(QWidget):
         self._last_rect = None
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
-        self._timer.start(140)
+        self._timer.start(40)
 
     # ---------- 建 ----------
     def ensure(self):
@@ -3542,6 +3516,8 @@ class VideoBody(QWidget):
             self._fail("播放器页面加载失败")
             return
         self.page_loaded = True
+        # 页面保持媒体解码状态，QWebEngineView 本身始终不显示到桌面。
+        self.view.page().setVisible(True)
         pending = self.pending_clip
         self.pending_clip = None
         if pending:
@@ -3552,6 +3528,7 @@ class VideoBody(QWidget):
         self.loaded_clip = ""
         self.pending_clip = None
         self.frame_ready = False
+        self.frame_image = None
         self.hide()
         pet = self.target_pet
         if pet is not None:
@@ -3591,6 +3568,7 @@ class VideoBody(QWidget):
     def _start_clip(self, clip, loop):
         if clip != self.loaded_clip:
             self.frame_ready = False
+            self.frame_image = None
             self._js("playClip(%s,%s)" % (json.dumps(clip, ensure_ascii=False),
                                           "true" if loop else "false"))
             self.loaded_clip = clip
@@ -3603,6 +3581,7 @@ class VideoBody(QWidget):
         self.loaded_clip = ""
         self.pending_clip = None
         self.frame_ready = False
+        self.frame_image = None
         self._js("var e=document.getElementById('v'); if(e){e.pause();}")
         self.hide()
 
@@ -3633,33 +3612,38 @@ class VideoBody(QWidget):
             if self._fit_args:            # 量到了就按真实位置重摆一次
                 try:
                     self.fit_to(*self._fit_args)
-                    self._set_region()    # 顺手把区域收窄到角色那一条
                 except Exception as e:
                     print("重摆视频窗失败:", e)
 
     def _poll(self):
-        if not self.ready or self.view is None or not self.isVisible():
+        if not self.page_loaded or self.view is None or not self.clip or self._poll_pending:
             return
+        if isinstance(self.target_pet, QWidget) and not self.target_pet.isVisible():
+            return
+        self._poll_pending = True
         self._js(VIDEO_INFO_JS, lambda v: self._got_info(v))
 
     def _got_info(self, v):
+        self._poll_pending = False
         v = self._as_obj(v)
         if not isinstance(v, dict):
             return
+        if v.get("name") != self.clip:
+            return
+        frame = v.pop("frame", "")
         self.info = v
         if v.get("err"):
             print("[视频] 播放失败：", v["err"])
             self._fail("视频播放失败：%s" % v["err"])
             return
-        frame_ready = bool(v.get("frameReady")) or (
-            int(v.get("readyState") or 0) >= 2 and int(v.get("w") or 0) > 0
-            and int(v.get("h") or 0) > 0)
-        if frame_ready != self.frame_ready:
-            self.frame_ready = frame_ready
+        if frame:
+            image = QImage.fromData(base64.b64decode(frame), "PNG")
+            if not image.isNull():
+                self.frame_image = image
+                self.frame_ready = True
             pet = self.target_pet
             if pet is not None:
                 pet.update()
-            return
         if v.get("ended") and not self.loop and self.clip:
             if time.time() - self._last_end > 0.8:
                 self._last_end = time.time()
@@ -3694,109 +3678,6 @@ class VideoBody(QWidget):
         if rect != self._last_rect:
             self._last_rect = rect
             self.setGeometry(*rect)
-            self._set_region()
-        if not self.isVisible():
-            self.show()
-        _remove_dwm_border(self)
-        self._click_through()
-        self._hook_mouse()
-
-    def _set_region(self):
-        """给视频窗设一个「只盖住角色那一条」的窗口区域。
-
-        区域外**既不渲染也不吃鼠标** —— Chromium 的渲染子窗属于渲染进程、改不了它的
-        窗口样式，只能从区域上把左右两条空白裁掉，免得它们悄悄吞掉点击。
-        """
-        try:
-            bb = self.bbox or {"x0": 0.30, "x1": 0.70, "y1": 0.92}
-            w, h = float(self.width()), float(self.height())
-            dpr = float(self.devicePixelRatioF() or 1.0)
-            x0 = int(max(0.0, bb["x0"] - 0.03) * w * dpr)
-            x1 = int(min(1.0, bb["x1"] + 0.03) * w * dpr)
-            y1 = int(min(1.0, bb.get("y1", 0.92) + 0.01) * h * dpr)
-            rgn = ctypes.windll.gdi32.CreateRectRgn(x0, 0, max(x0 + 8, x1), max(8, y1))
-            ctypes.windll.user32.SetWindowRgn(int(self.winId()), rgn, True)
-        except Exception as e:
-            print("视频窗区域没设上:", e)
-
-    def _click_through(self):
-        """系统层面点击穿透（WS_EX_TRANSPARENT）：Chromium 的渲染子窗是**原生子窗口**，
-        Qt 层的事件过滤器看不到它的鼠标事件，只能从窗口样式上让它整体穿透。
-        再叠一层 Qt 层转发（_hook_mouse）当保险，两者不会同时生效、不会双击。"""
-        try:
-            u = ctypes.windll.user32
-            GWL_EXSTYLE, WS_EX_TRANSPARENT, WS_EX_NOACTIVATE = -20, 0x20, 0x08000000
-            SWP = 0x0001 | 0x0002 | 0x0004 | 0x0020
-            targets = [int(self.winId())]
-            stack = [int(self.winId())]
-            GW_CHILD, GW_HWNDNEXT = 5, 2
-            while stack:
-                h = stack.pop()
-                c = u.GetWindow(h, GW_CHILD)
-                while c:
-                    targets.append(int(c))
-                    stack.append(int(c))
-                    c = u.GetWindow(c, GW_HWNDNEXT)
-            for h in targets:
-                ex = u.GetWindowLongW(h, GWL_EXSTYLE)
-                if not (ex & WS_EX_TRANSPARENT):
-                    u.SetWindowLongW(h, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)
-                    u.SetWindowPos(h, 0, 0, 0, 0, 0, SWP)
-        except Exception as e:
-            print("视频窗穿透没设上:", e)
-
-    def _hook_mouse(self):
-        """把视频窗（含 Chromium 的渲染子部件）的鼠标事件转发给桌宠本体。
-
-        不然视频窗会吃掉鱼身上的点击/拖拽 —— 那样鱼就点不动了。
-        """
-        try:
-            targets = [self.view]
-            fp = None
-            try:
-                fp = self.view.focusProxy()
-            except Exception:
-                fp = None
-            if fp is not None:
-                targets.append(fp)
-            for w in targets:
-                if w is not None and w not in self._filters:
-                    w.installEventFilter(self)
-                    self._filters.append(w)
-        except Exception as e:
-            print("视频窗鼠标转发没挂上:", e)
-
-    def eventFilter(self, obj, ev):
-        """视频窗上的鼠标事件 → 转给桌宠（含拖拽：按下时抓鼠标，松开释放）"""
-        try:
-            t = ev.type()
-            pet = self.target_pet
-            if pet is None:
-                return False
-            if t in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick,
-                     QEvent.Type.MouseMove, QEvent.Type.MouseButtonRelease):
-                gp = ev.globalPosition().toPoint()
-                lp = pet.mapFromGlobal(gp)
-                ne = QMouseEvent(t, QPointF(lp), QPointF(gp), ev.button(), ev.buttons(),
-                                 ev.modifiers())
-                QApplication.sendEvent(pet, ne)
-                if t == QEvent.Type.MouseButtonPress and not self._grab:
-                    self._grab = True
-                    try:
-                        pet.grabMouse()
-                    except Exception:
-                        self._grab = False
-                elif t == QEvent.Type.MouseButtonRelease and self._grab:
-                    self._grab = False
-                    try:
-                        pet.releaseMouse()
-                    except Exception:
-                        pass
-                return True
-        except Exception as e:
-            print("视频窗鼠标转发失败:", e)
-        return False
-
 
 class PetWindow(QWidget):
     def locate_me(self, auto=False):
@@ -4208,7 +4089,9 @@ class PetWindow(QWidget):
 
     # ---------- 绘制 ----------
     def paintEvent(self, _):
-        p = QPainter(self)
+        image = QImage(self.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        p = QPainter(image)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         now = self.t * TICK / 1000.0
@@ -4298,16 +4181,36 @@ class PetWindow(QWidget):
             p.restore()
 
         cur_key = self._sprite_key(act.get("sprite"), act.get("facing"))
-        if self.video is not None and self.video.isVisible() and self.video.frame_ready:
-            # 视频顶替立绘时，以角色本身的透明轮廓承接鼠标，避免矩形点击区形成边框。
-            p.setOpacity(1.0 / 255.0)
-            draw_one(cur_key, 1.0 / 255.0)
+        if self.video is not None and self.video.frame_ready and self.video.frame_image is not None:
+            # 在本体窗口绘制真实透明视频帧，鼠标直接命中角色，不再叠放浏览器窗口。
+            rect = QRectF(self.video.x() - self.x(), self.video.y() - self.y(),
+                          self.video.width(), self.video.height())
+            p.save()
+            if self.video.mirror:
+                p.translate(rect.center().x(), 0)
+                p.scale(-1, 1)
+                p.translate(-rect.center().x(), 0)
+            p.drawImage(rect, self.video.frame_image)
+            p.restore()
+            self._present_pet_frame(image, p)
             return
         if self.cross_t > 0:
             draw_one(self.prev_key, self.cross_t)
             draw_one(cur_key, 1.0 - self.cross_t)
         else:
             draw_one(cur_key, 1.0)
+        self._present_pet_frame(image, p)
+
+    def _present_pet_frame(self, image, painter):
+        painter.end()
+        output = QPainter(self)
+        output.drawImage(0, 0, image)
+        output.end()
+        # 窗口区域与实际角色/气泡轮廓一致，透明区域既不显示系统背景也不拦截点击。
+        region = QRegion(QBitmap.fromImage(image.createAlphaMask()))
+        if region != getattr(self, "_paint_region", None):
+            self._paint_region = region
+            self.setMask(region)
 
     def _sprite_key(self, name_override=None, facing_override=None):
         if name_override:
@@ -4476,7 +4379,7 @@ class PetWindow(QWidget):
 
     def _on_clip_end(self, clip):
         """一段演完 → 接回待机循环（和 dsh-pet 的动画链一个意思）"""
-        if self.video is not None and self.video.isVisible() and not self.flying:
+        if self.video is not None and self.video.clip and not self.flying:
             idle = self.clip_for("待机")
             if idle:
                 self.video.play(idle, loop=True)
@@ -4498,17 +4401,14 @@ class PetWindow(QWidget):
         return self.show_clip(clip, loop=False)
 
     def _sync_video(self):
-        """把视频窗摆到立绘的位置上（每 tick 跟一下，走路/拖拽/飞行都跟得上）"""
+        """更新视频帧在本体中的绘制位置，跟随走路、拖拽和飞行。"""
         if self.video is None or not self.video.clip:
             return
         if not self.isVisible():
             return                    # 本体藏起来了（护眼/显示隐藏）→ 视频也别冒出来
         cx = self.x() + self.width() / 2
         bottom = self.y() + BUBBLE_H + MARGIN + self.cur_h
-        was = self.video.isVisible()
         self.video.fit_to(cx, bottom, self.cur_h, mirror=self.facing < 0)
-        if not was and self.video.isVisible():
-            self.raise_()             # 本体压在视频上面，命中区才生效
 
     def set_video_anim(self, on):
         """切换视频动画 / 手绘立绘"""
@@ -4529,7 +4429,7 @@ class PetWindow(QWidget):
         """闲着的时候按权重随机接一个动作（有点 dsh-pet 那种「动画链」的意思）"""
         if self.action or self.flying or self.jump_t > 0 or self.dragging:
             return
-        if (self.video is not None and self.video.isVisible() and self.video.clip
+        if (self.video is not None and self.video.clip
                 and not self.video.loop):
             return                                       # 正在演一个动作 clip，别插队
         if (self.video_ready() and self.video is not None
@@ -5011,13 +4911,12 @@ class PetWindow(QWidget):
     # ---------- 鼠标事件 ----------
     def hideEvent(self, e):
         if self.video is not None:            # 本体藏起来（护眼/显示隐藏）时视频也藏
-            self.video.hide()
+            self.video.stop()
         super().hideEvent(e)
 
     def showEvent(self, e):
         super().showEvent(e)
-        _remove_dwm_border(self)
-        if self.video_ready() and (self.video is None or not self.video.isVisible()):
+        if self.video_ready() and (self.video is None or not self.video.clip):
             QTimer.singleShot(400, self._video_idle)     # 一出来就播待机动画
 
     def mousePressEvent(self, e):
