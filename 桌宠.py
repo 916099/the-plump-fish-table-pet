@@ -3806,9 +3806,16 @@ class PetWindow(QWidget):
         super().__init__(None, flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("大肥鱼桌宠")
+        self.setAutoFillBackground(False)
+        self.setStyleSheet("PetWindow { background: transparent; border: none; }")
         
         # 精灵加载
         self.sprites = {}
+        # 尺寸缓存只负责布局；绘制始终使用原图，避免先缩小再放大。
+        self.original_sprites = {
+            name: QPixmap(os.path.join(SPRITE_DIR, f"{name}.png"))
+            for name in ["正面", "侧面", "背面"]
+        }
         for label, mult in SIZE_LEVELS.items():
             h = int(340 * mult)
             for name in ["正面", "侧面", "背面"]:
@@ -4089,7 +4096,10 @@ class PetWindow(QWidget):
 
     # ---------- 绘制 ----------
     def paintEvent(self, _):
-        image = QImage(self.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        dpr = self.devicePixelRatioF()
+        image = QImage(round(self.width() * dpr), round(self.height() * dpr),
+                       QImage.Format.Format_ARGB32_Premultiplied)
+        image.setDevicePixelRatio(dpr)
         image.fill(Qt.GlobalColor.transparent)
         p = QPainter(image)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -4177,7 +4187,11 @@ class PetWindow(QWidget):
                 p.translate(cx, 0)
                 p.scale(-1, 1)
                 p.translate(-cx, 0)
-            p.drawPixmap(QRectF(dx, dy, pw, ph), pix, QRectF(0, 0, pix.width(), pix.height()))
+            source = self.original_sprites.get(name, pix)
+            if source.isNull():
+                source = pix
+            p.drawPixmap(QRectF(dx, dy, pw, ph), source,
+                         QRectF(0, 0, source.width(), source.height()))
             p.restore()
 
         cur_key = self._sprite_key(act.get("sprite"), act.get("facing"))
@@ -4204,10 +4218,17 @@ class PetWindow(QWidget):
     def _present_pet_frame(self, image, painter):
         painter.end()
         output = QPainter(self)
+        # 覆盖旧缓冲区的透明像素，防止轮廓移动后残留半透明底色。
+        output.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         output.drawImage(0, 0, image)
         output.end()
         # 窗口区域与实际角色/气泡轮廓一致，透明区域既不显示系统背景也不拦截点击。
-        region = QRegion(QBitmap.fromImage(image.createAlphaMask()))
+        # QWidget 的区域使用逻辑坐标，不能把高 DPI 的物理像素直接交给 setMask。
+        mask_image = image.scaled(self.size(), Qt.AspectRatioMode.IgnoreAspectRatio,
+                                  Qt.TransformationMode.SmoothTransformation)
+        mask_image.setDevicePixelRatio(1.0)
+        region = QRegion(QBitmap.fromImage(mask_image.createAlphaMask(
+            Qt.ImageConversionFlag.ThresholdAlphaDither)))
         if region != getattr(self, "_paint_region", None):
             self._paint_region = region
             self.setMask(region)
@@ -4916,8 +4937,26 @@ class PetWindow(QWidget):
 
     def showEvent(self, e):
         super().showEvent(e)
+        self._disable_native_decoration()
         if self.video_ready() and (self.video is None or not self.video.clip):
             QTimer.singleShot(400, self._video_idle)     # 一出来就播待机动画
+
+    def _disable_native_decoration(self):
+        """透明工具窗口不使用 Windows 的矩形背景、圆角及非客户区边框。"""
+        if sys.platform != "win32":
+            return
+        try:
+            setter = ctypes.windll.dwmapi.DwmSetWindowAttribute
+            setter.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+            setter.restype = ctypes.c_long
+            hwnd = int(self.winId())
+            # NCRENDERING_POLICY=DISABLED, CORNER=DONOTROUND,
+            # BORDER_COLOR=NONE, SYSTEMBACKDROP_TYPE=NONE。
+            for attr, value in ((2, 1), (33, 1), (34, 0xfffffffe), (38, 1)):
+                native_value = ctypes.c_uint(value)
+                setter(hwnd, attr, ctypes.byref(native_value), ctypes.sizeof(native_value))
+        except (AttributeError, OSError):
+            pass   # 旧 Windows 不支持这些属性时仍使用 Qt 的透明轮廓。
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
