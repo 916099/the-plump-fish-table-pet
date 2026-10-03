@@ -2189,18 +2189,21 @@ video{position:fixed;left:0;top:0;width:100%;height:100%;object-fit:contain;
       background:transparent;pointer-events:none;}
 </style></head><body><video id="v" playsinline preload="auto"></video><script>
 const v=document.getElementById('v');
-window.__st={name:"",ended:false,err:""};
+window.__st={name:"",ended:false,err:"",frameReady:false};
 v.addEventListener('ended',()=>{window.__st.ended=true;});
 v.addEventListener('error',()=>{window.__st.err=String((v.error&&v.error.code)||-1);});
+v.addEventListener('loadstart',()=>{window.__st.frameReady=false;});
+v.addEventListener('loadeddata',()=>{window.__st.frameReady=true;});
 window.playClip=function(name,loop){
-  window.__st={name:name,ended:false,err:""};
+  window.__st={name:name,ended:false,err:"",frameReady:false};
   v.loop=!!loop; v.src=encodeURI(name)+".webm";
   v.play().catch(e=>{window.__st.err=String(e);});
   return true;
 };
 window.setMirror=function(on){v.style.transform=on?"scaleX(-1)":"none";};
 window.videoInfo=function(){return {w:v.videoWidth,h:v.videoHeight,t:v.currentTime,
-  dur:v.duration||0,ended:window.__st.ended,err:window.__st.err,name:window.__st.name};};
+  dur:v.duration||0,ended:window.__st.ended,err:window.__st.err,name:window.__st.name,
+  frameReady:window.__st.frameReady,readyState:v.readyState};};
 window.measureAlpha=function(){
   try{
     if(!v.videoWidth) return null;
@@ -2325,7 +2328,8 @@ def start_anim_server():
 VIDEO_INFO_JS = ("JSON.stringify((function(){var v=document.querySelector('video');"
                  "if(!v) return null;"
                  "return {w:v.videoWidth,h:v.videoHeight,t:v.currentTime,dur:v.duration||0,"
-                 "ended:!!v.ended,err:(window.__st&&window.__st.err)||''};})())")
+                 "ended:!!v.ended,err:(window.__st&&window.__st.err)||'',"
+                 "frameReady:!!(window.__st&&window.__st.frameReady),readyState:v.readyState};})())")
 VIDEO_MEASURE_JS = (
     "(function(){try{var v=document.querySelector('video');"
     "if(!v||!v.videoWidth||v.readyState<2) return null;"
@@ -3427,7 +3431,11 @@ class VideoBody(QWidget):
         self.view = None
         self.profile = None
         self.ready = False
+        self.page_loaded = False
+        self.pending_clip = None
+        self.frame_ready = False
         self.clip = ""
+        self.loaded_clip = ""
         self.loop = True
         self.mirror = False
         self.bbox = None                 # 角色在 16:9 画幅里占的比例（量一次就一直用）
@@ -3468,6 +3476,7 @@ class VideoBody(QWidget):
             return None
         self.view = QWebEngineView(self)
         self.view.setStyleSheet("QWebEngineView { border: none; background: transparent; }")
+        self.view.loadFinished.connect(self._on_page_loaded)
         page = QWebEnginePage(self.profile, self.view)
         self.view.setPage(page)
         page.renderProcessTerminated.connect(self._on_render_process_terminated)
@@ -3500,16 +3509,34 @@ class VideoBody(QWidget):
         self.ready = True
         return self.view
 
-    def _on_render_process_terminated(self, status, exit_code):
-        """Chromium 子进程崩溃时收起空视频窗，立即恢复 PNG 立绘。"""
-        print("[视频] Chromium 渲染进程退出：%s，代码 %s" % (status, exit_code))
+    def _on_page_loaded(self, ok):
+        """播放器页面加载后才下发排队的播放指令。"""
+        if not ok:
+            self._fail("播放器页面加载失败")
+            return
+        self.page_loaded = True
+        pending = self.pending_clip
+        self.pending_clip = None
+        if pending:
+            self._start_clip(*pending)
+
+    def _fail(self, message):
         self.clip = ""
+        self.loaded_clip = ""
+        self.pending_clip = None
+        self.frame_ready = False
         self.hide()
         pet = self.target_pet
         if pet is not None:
             pet._video_failed = True
             pet.update()
             pet.say("视频动画没启动起来，我先切回立绘～")
+
+    def _on_render_process_terminated(self, status, exit_code):
+        """Chromium 子进程崩溃时收起空视频窗，立即恢复 PNG 立绘。"""
+        print("[视频] Chromium 渲染进程退出：%s，代码 %s" % (status, exit_code))
+        self.page_loaded = False
+        self._fail("Chromium 渲染进程退出")
 
     # ---------- 播 ----------
     def _js(self, code, cb=None):
@@ -3527,17 +3554,28 @@ class VideoBody(QWidget):
         if not clip or not self.ensure():
             return False
         self.loop = bool(loop)
-        if clip != self.clip:
-            self.clip = clip
+        self.clip = clip
+        if not self.page_loaded:
+            self.pending_clip = (clip, self.loop)
+            return True
+        self._start_clip(clip, self.loop)
+        return True
+
+    def _start_clip(self, clip, loop):
+        if clip != self.loaded_clip:
+            self.frame_ready = False
             self._js("playClip(%s,%s)" % (json.dumps(clip, ensure_ascii=False),
                                           "true" if loop else "false"))
+            self.loaded_clip = clip
         else:
-            self._js("document.getElementById('v').play()")
-            self._js("document.getElementById('v').loop=%s" % ("true" if loop else "false"))
-        return True
+            self._js("document.getElementById('v').loop=%s; document.getElementById('v').play()"
+                     % ("true" if loop else "false"))
 
     def stop(self):
         self.clip = ""
+        self.loaded_clip = ""
+        self.pending_clip = None
+        self.frame_ready = False
         self._js("var e=document.getElementById('v'); if(e){e.pause();}")
         self.hide()
 
@@ -3584,13 +3622,16 @@ class VideoBody(QWidget):
         self.info = v
         if v.get("err"):
             print("[视频] 播放失败：", v["err"])
+            self._fail("视频播放失败：%s" % v["err"])
+            return
+        frame_ready = bool(v.get("frameReady")) or (
+            int(v.get("readyState") or 0) >= 2 and int(v.get("w") or 0) > 0
+            and int(v.get("h") or 0) > 0)
+        if frame_ready != self.frame_ready:
+            self.frame_ready = frame_ready
             pet = self.target_pet
-            self.clip = ""
-            self.hide()
             if pet is not None:
-                pet._video_failed = True
                 pet.update()
-                pet.say("视频动画没播起来，我先切回立绘～")
             return
         if v.get("ended") and not self.loop and self.clip:
             if time.time() - self._last_end > 0.8:
@@ -4229,7 +4270,7 @@ class PetWindow(QWidget):
             p.restore()
 
         cur_key = self._sprite_key(act.get("sprite"), act.get("facing"))
-        if self.video is not None and self.video.isVisible():
+        if self.video is not None and self.video.isVisible() and self.video.frame_ready:
             # 视频在顶着 → 立绘不画。但要在角色位置留一层「几乎全透明」的命中区：
             # 分层窗口只有**完全透明**的像素才放过鼠标，alpha=1/255 就够把
             # 点击/拖拽留在本体上（眼睛看不出来）。气泡照样画在下面。
