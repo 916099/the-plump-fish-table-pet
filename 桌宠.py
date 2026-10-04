@@ -22,9 +22,9 @@ import threading
 import time
 import winreg
 try:
-    from PIL import Image as PILImage, ImageFilter
+    from PIL import Image as PILImage, ImageFilter, ImageChops, ImageStat
 except ImportError:
-    PILImage = ImageFilter = None
+    PILImage = ImageFilter = ImageChops = ImageStat = None
 try:
     import imageio_ffmpeg
     VIDEO_FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
@@ -187,7 +187,7 @@ SIZE_LEVELS = {"小": 0.55, "中": 0.7, "大": 0.9}
 SPEED = 380.0
 TICK = 20
 FRAME_INTERVAL = 8                   # 约 120 Hz；逻辑时间和速度仍以原来的 20 ms 为基准
-ANIMATION_TRANSITION_SECONDS = 0.24  # 动作切换留出更柔和的过渡
+ANIMATION_TRANSITION_SECONDS = 0.36  # 动态交接的默认时长；收尾与待机稍长一些
 AUTO_ACTION_GAP_SECONDS = (6.0, 12.0)
 # 所有素材沿用待机首帧的角色比例；道具和画幅留白不能改变本体尺寸。
 ANIMATION_BODY_BOUNDS = {"x0": 425 / 1280, "x1": 853 / 1280,
@@ -3439,19 +3439,26 @@ class EyeRestOverlay(QWidget):
 class _NativeWebMDecoder(QThread):
     """在后台直接解码 VP9 alpha，避免浏览器每帧编码 PNG 和跨进程传递 Base64。"""
     processed = Signal(object)
+    prepared = Signal(object)
+    nearing_end = Signal(str)
+    finishing = Signal(str)
     bounds_ready = Signal(object)
     clip_ended = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, path, clip, loop, generation, rect, dpr):
+    def __init__(self, path, clip, loop, generation, rect, dpr,
+                 start_frame=0, frame_count=0):
         super().__init__()
         self.path, self.clip, self.loop, self.generation = path, clip, loop, generation
         self.render_target = (QRectF(rect), dpr)
         self.process = None
+        self.start_frame, self.frame_count = start_frame, frame_count
+        self._activation = threading.Event()
+        self._near_end_sent = self._finishing_sent = False
         self.width, self.height = ((1280, 720) if os.path.basename(os.path.dirname(path)) == "hd" else (640, 360))
 
     def stop(self):
-        self.requestInterruption()
+        self.request_stop()
         process = self.process
         if process is not None and process.poll() is None:
             try:
@@ -3460,12 +3467,23 @@ class _NativeWebMDecoder(QThread):
                 pass
         self.wait(3000)
 
+    def request_stop(self):
+        """切换时只发停止请求；等待线程回收只在应用退出时进行。"""
+        self.requestInterruption()
+        self._activation.set()
+
+    def activate(self):
+        self._activation.set()
+
     def run(self):
         command = [VIDEO_FFMPEG, "-v", "error", "-threads", "2"]
         if self.loop:
             command += ["-stream_loop", "-1"]
-        command += ["-c:v", "libvpx-vp9", "-i", self.path, "-an",
-                    "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
+        command += ["-c:v", "libvpx-vp9", "-i", self.path, "-an"]
+        if self.start_frame:
+            # 仅跳过第一次进入循环之前的帧，之后仍播放完整待机周期。
+            command += ["-vf", "trim=start_frame=%d,setpts=PTS-STARTPTS" % self.start_frame]
+        command += ["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
         try:
             self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                             creationflags=subprocess.CREATE_NO_WINDOW)
@@ -3481,6 +3499,11 @@ class _NativeWebMDecoder(QThread):
                         else:
                             self.clip_ended.emit(self.clip)
                     break
+                if index > 0 and index < int((time.perf_counter() - started) * 24):
+                    # 解码暂时落后时跳过过期帧，避免延迟逐帧积累到动作收尾。
+                    self._notify_handoff(index)
+                    index += 1
+                    continue
                 image = QImage(data, self.width, self.height, self.width*4,
                                QImage.Format.Format_RGBA8888).copy()
                 if index == 0 and PILImage is not None:
@@ -3492,14 +3515,23 @@ class _NativeWebMDecoder(QThread):
                             y0=y0/self.height,x1=x1/self.width,y1=y1/self.height))
                 rect,dpr = self.render_target
                 result = VideoBody._process_frame(self.clip,self.generation,image,rect,dpr)
-                if started is None:
+                if index == 0:
+                    self.prepared.emit(result)
+                    while not self._activation.wait(0.02):
+                        if self.isInterruptionRequested():
+                            break
+                    if self.isInterruptionRequested():
+                        break
                     started = time.perf_counter()
+                    index = 1
+                    continue
                 deadline = started + index/24.0
                 while time.perf_counter()<deadline and not self.isInterruptionRequested():
                     self.msleep(min(5,max(1,int((deadline-time.perf_counter())*1000))))
                 if self.isInterruptionRequested():
                     break
                 self.processed.emit(result)
+                self._notify_handoff(index)
                 index += 1
         except (OSError, ValueError) as error:
             if not self.isInterruptionRequested():
@@ -3510,6 +3542,17 @@ class _NativeWebMDecoder(QThread):
                     self.process.kill()
                 self.process.wait()
                 self.process.stdout.close()
+
+    def _notify_handoff(self, index):
+        if self.loop or not self.frame_count:
+            return
+        remaining = self.frame_count - self.start_frame - index - 1
+        if remaining <= 18 and not self._near_end_sent:
+            self._near_end_sent = True
+            self.nearing_end.emit(self.clip)
+        if remaining <= 9 and not self._finishing_sent:
+            self._finishing_sent = True
+            self.finishing.emit(self.clip)
 
 
 class VideoBody(QWidget):
@@ -3525,6 +3568,27 @@ class VideoBody(QWidget):
         self.target_pet = None           # 收到新的视频帧时重绘桌宠本体
         self.view = None
         self.native_decoder = None
+        self._pending_decoder = None
+        self._idle_decoder = None
+        self._outgoing_decoder = None
+        self._retired_decoders = []
+        self._prepared_frames = {}
+        self._current_result = None
+        self._outgoing_result = None
+        self._outgoing_snapshot = None
+        self._transition_started = 0.0
+        self._transition_seconds = ANIMATION_TRANSITION_SECONDS
+        self._transition_serial = 0
+        self._catalogue = load_json(os.path.join(ANIM_DIR, "transition_index.json"), {})
+        self._idle_poses = []
+        if PILImage is not None:
+            for encoded in self._catalogue.get("idle_poses", []):
+                try:
+                    self._idle_poses.append(PILImage.frombytes("RGBA", (32, 40),
+                                                              base64.b64decode(encoded)))
+                except (ValueError, TypeError):
+                    self._idle_poses = []
+                    break
         self.use_native = bool(VIDEO_FFMPEG)
         self.profile = None
         self.ready = False
@@ -3538,7 +3602,7 @@ class VideoBody(QWidget):
         self._frame_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pet-frame")
         QApplication.instance().aboutToQuit.connect(
             lambda: self._frame_executor.shutdown(wait=True, cancel_futures=True))
-        QApplication.instance().aboutToQuit.connect(self._stop_native)
+        QApplication.instance().aboutToQuit.connect(self._shutdown_native)
         self._frame_processed.connect(self._accept_processed_frame)
         self.clip = ""
         self.loaded_clip = ""
@@ -3682,23 +3746,29 @@ class VideoBody(QWidget):
         if self.use_native:
             if (self.native_decoder is not None and self.native_decoder.isRunning()
                     and clip == self.loaded_clip and loop == self.native_decoder.loop):
+                if self._pending_decoder is not None:
+                    self._retire_decoder(self._pending_decoder)
+                    self._pending_decoder = None
                 return
-            self._stop_native()
-            self._decode_generation += 1
-            self.frame_ready = False
-            self.frame_image = None
-            hd_path = os.path.join(ANIM_DIR, "hd", clip+".webm")
-            path = hd_path if os.path.isfile(hd_path) else os.path.join(ANIM_DIR,clip+".webm")
-            pet = self.target_pet
-            decoder = _NativeWebMDecoder(path,clip,loop,self._decode_generation,self.render_rect,
-                                         pet.devicePixelRatioF() if pet is not None else 1.0)
-            decoder.processed.connect(self._accept_processed_frame)
-            decoder.bounds_ready.connect(self._native_bounds)
-            decoder.clip_ended.connect(self._native_end)
-            decoder.failed.connect(self._fail)
-            self.native_decoder = decoder
-            self.loaded_clip = clip
-            decoder.start()
+            if (self._pending_decoder is not None and self._pending_decoder.clip == clip
+                    and self._pending_decoder.loop == loop):
+                return
+            if self._pending_decoder is not None:
+                self._retire_decoder(self._pending_decoder)
+                self._pending_decoder = None
+            if self._idle_decoder is not None and clip == self._idle_decoder.clip and loop:
+                decoder = self._idle_decoder
+                self._idle_decoder = None
+            else:
+                start_frame = (self._closest_idle_frame(self.frame_image)
+                               if loop and clip == self._catalogue.get("idle_clip") else 0)
+                decoder = self._new_decoder(clip, loop, start_frame)
+            self._pending_decoder = decoder
+            prepared = self._prepared_frames.get(decoder)
+            if prepared is not None:
+                self._commit_decoder(decoder, prepared)
+            elif not decoder.isRunning():
+                decoder.start()
             return
         if clip != self.loaded_clip:
             self._decode_generation += 1
@@ -3723,13 +3793,156 @@ class VideoBody(QWidget):
         self.hide()
 
     def _stop_native(self):
-        decoder = self.native_decoder
-        if decoder is not None:
-            self.native_decoder = None
+        for decoder in (self.native_decoder, self._pending_decoder, self._idle_decoder,
+                        self._outgoing_decoder):
+            self._retire_decoder(decoder)
+        self.native_decoder = self._pending_decoder = self._idle_decoder = None
+        self._outgoing_decoder = None
+        self._current_result = self._outgoing_result = self._outgoing_snapshot = None
+        self._transition_serial += 1
+
+    def _shutdown_native(self):
+        self._stop_native()
+        for decoder in list(self._retired_decoders):
             decoder.stop()
+        self._prune_decoders()
+
+    def _retire_decoder(self, decoder):
+        if decoder is not None and decoder not in self._retired_decoders:
+            self._prepared_frames.pop(decoder, None)
+            self._retired_decoders.append(decoder)
+            decoder.request_stop()
+            if not decoder.isRunning():
+                self._prune_decoders()
+
+    def _prune_decoders(self):
+        for decoder in list(self._retired_decoders):
+            if not decoder.isRunning():
+                self._retired_decoders.remove(decoder)
+                decoder.deleteLater()
+
+    def _new_decoder(self, clip, loop, start_frame=0):
+        hd_path = os.path.join(ANIM_DIR, "hd", clip + ".webm")
+        path = hd_path if os.path.isfile(hd_path) else os.path.join(ANIM_DIR, clip + ".webm")
+        meta = self._catalogue.get("assets", {}).get(clip, {})
+        if meta.get("bytes") != os.path.getsize(path):
+            meta = {}
+        self._decode_generation += 1
+        pet = self.target_pet
+        decoder = _NativeWebMDecoder(path, clip, loop, self._decode_generation,
+            self.render_rect, pet.devicePixelRatioF() if pet is not None else 1.0,
+            start_frame, meta.get("frames", 0))
+        decoder.prepared.connect(self._native_prepared)
+        decoder.processed.connect(self._accept_processed_frame)
+        decoder.bounds_ready.connect(self._native_bounds)
+        decoder.nearing_end.connect(self._prepare_idle)
+        decoder.finishing.connect(self._native_finishing)
+        decoder.clip_ended.connect(self._native_end)
+        decoder.failed.connect(self._native_failed)
+        decoder.finished.connect(self._prune_decoders)
+        return decoder
+
+    def _native_prepared(self, result):
+        decoder = self.sender()
+        if decoder not in (self._pending_decoder, self._idle_decoder):
+            return
+        self._prepared_frames[decoder] = result
+        if decoder is self._pending_decoder:
+            self._commit_decoder(decoder, result)
+
+    def _commit_decoder(self, decoder, result):
+        if decoder is not self._pending_decoder or decoder.clip != self.clip:
+            return
+        pet = self.target_pet
+        interrupted_blend = self._outgoing_result is not None or self._outgoing_snapshot is not None
+        self._retire_decoder(self._outgoing_decoder)
+        self._outgoing_decoder = self.native_decoder
+        self._outgoing_result = self._current_result
+        self._outgoing_snapshot = None
+        if interrupted_blend and pet is not None:
+            previous = getattr(pet, "_video_body_image", None)
+            if previous is not None:
+                self._outgoing_snapshot = (previous.copy(), QPoint(pet._video_body_offset))
+                self._retire_decoder(self._outgoing_decoder)
+                self._outgoing_decoder = None
+                self._outgoing_result = None
+        self._pending_decoder = None
+        self.native_decoder = decoder
+        self.loaded_clip = decoder.clip
+        self._prepared_frames.pop(decoder, None)
+        self._transition_serial += 1
+        self._transition_started = time.monotonic()
+        self._transition_seconds = (0.42 if decoder.clip in ANIM_POOLS.get("待机", []) else 0.34)
+        if self._outgoing_result is not None or self._outgoing_snapshot is not None:
+            serial = self._transition_serial
+            QTimer.singleShot(round(self._transition_seconds * 1000) + 10,
+                              lambda: self._finish_transition(serial))
+        self._publish_frame(result)
+        decoder.activate()
+
+    def _finish_transition(self, serial):
+        if serial != self._transition_serial:
+            return
+        self._retire_decoder(self._outgoing_decoder)
+        self._outgoing_decoder = None
+        self._outgoing_result = self._outgoing_snapshot = None
+        if self.target_pet is not None:
+            self.target_pet.update()
+
+    def transition_weight(self, now):
+        if self._outgoing_result is None and self._outgoing_snapshot is None:
+            return 1.0
+        progress = min(1.0, max(0.0, (now - self._transition_started) / self._transition_seconds))
+        return progress * progress * (3.0 - 2.0 * progress)
+
+    def _closest_idle_frame(self, image):
+        if image is None or not self._idle_poses or PILImage is None:
+            return 0
+        sample = image.scaled(96, 54, Qt.AspectRatioMode.IgnoreAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation).copy(18, 3, 60, 51)
+        sample = sample.scaled(32, 40, Qt.AspectRatioMode.IgnoreAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation)
+        sample = sample.convertToFormat(QImage.Format.Format_RGBA8888_Premultiplied)
+        pose = PILImage.frombytes("RGBA", (32, 40), bytes(sample.constBits()))
+        def distance(candidate):
+            means = ImageStat.Stat(ImageChops.difference(pose, candidate)).mean
+            return sum(means[:3]) + means[3] * 3
+        return min(range(len(self._idle_poses)), key=lambda index: distance(self._idle_poses[index]))
+
+    def _prepare_idle(self, clip):
+        if self.sender() is not self.native_decoder or self._pending_decoder is not None:
+            return
+        idle = next((c for c in ANIM_POOLS.get("待机", [])
+                     if os.path.isfile(os.path.join(ANIM_DIR, c + ".webm"))), "")
+        if not idle or idle == clip:
+            return
+        meta = self._catalogue.get("assets", {}).get(clip, {})
+        phase = meta.get("idle_entry_frame", 0) if idle == self._catalogue.get("idle_clip") else 0
+        self._retire_decoder(self._idle_decoder)
+        self._idle_decoder = self._new_decoder(idle, True, phase)
+        self._idle_decoder.start()
+
+    def _native_finishing(self, clip):
+        pet = self.target_pet
+        if (self.sender() is self.native_decoder and self._pending_decoder is None
+                and self._idle_decoder in self._prepared_frames and clip == self.clip
+                and self.on_clip_end and pet is not None and not pet.dragging and not pet.flying
+                and not pet._edge_impact_post_landing and not pet._edge_impact_pause_until):
+            self.on_clip_end(clip)
+
+    def _native_failed(self, message):
+        decoder = self.sender()
+        if decoder is self._idle_decoder:
+            self._idle_decoder = None
+            self._retire_decoder(decoder)
+        elif decoder in (self.native_decoder, self._pending_decoder):
+            self._fail(message)
 
     def _native_bounds(self, bounds):
-        if self.sender() is self.native_decoder and self.clip in ANIM_POOLS.get("待机", []) and self.bbox is None:
+        decoder = self.sender()
+        if (decoder in (self.native_decoder, self._pending_decoder)
+                and decoder is not None and decoder.clip == self.clip
+                and self.clip in ANIM_POOLS.get("待机", []) and self.bbox is None):
             self._got_bbox(bounds)
 
     def _native_end(self, clip):
@@ -3829,9 +4042,25 @@ class VideoBody(QWidget):
 
     def _accept_processed_frame(self, result):
         self._decode_pending = False
+        if self.use_native:
+            decoder = self.sender()
+            if decoder is self._outgoing_decoder:
+                self._outgoing_result = result
+                if self.target_pet is not None:
+                    self.target_pet.update()
+                return
+            if decoder is not self.native_decoder:
+                return
+            self._publish_frame(result)
+            return
         clip, generation, image, rect, dpr, enhanced, bounds = result
         if clip != self.clip or generation != self._decode_generation:
             return
+        self._publish_frame(result)
+
+    def _publish_frame(self, result):
+        clip, generation, image, rect, dpr, enhanced, bounds = result
+        self._current_result = result
         self.frame_image = image
         self.frame_ready = True
         pet = self.target_pet
@@ -3898,8 +4127,10 @@ class VideoBody(QWidget):
                            bottom - feet - pet._body_pos().y(), vw, vh)
             offset = pet._fit_animation_canvas(scene)
             self.render_rect = scene.translated(offset)
-            if self.native_decoder is not None:
-                self.native_decoder.render_target = (QRectF(self.render_rect),pet.devicePixelRatioF())
+            for decoder in (self.native_decoder, self._pending_decoder,
+                            self._idle_decoder, self._outgoing_decoder):
+                if decoder is not None:
+                    decoder.render_target = (QRectF(self.render_rect), pet.devicePixelRatioF())
             capture_width = max(640, int(round(vw * pet.devicePixelRatioF())))
             if capture_width != getattr(self, "_capture_width", None):
                 self._capture_width = capture_width
@@ -4371,7 +4602,12 @@ class PetWindow(QWidget):
                 self._idle_transition_from_image = None
                 self._idle_fade_started = None
         if video is not None and video.frame_ready and video.frame_image is not None:
-            if self._video_transition_clip == video.clip:
+            if video.use_native:
+                # Qt 使用 256 级覆盖率；互补权重落在同一网格，避免舍入损失 alpha。
+                video_transition_alpha = round(video.transition_weight(shake_now) * 256) / 256
+                if video_transition_alpha < 1.0:
+                    video_transition_frame = int((shake_now - video._transition_started) * 120)
+            elif self._video_transition_clip == video.clip:
                 if self._video_fade_started is None:
                     self._video_fade_started = shake_now
                 fade_progress = min(1.0, max(
@@ -4388,7 +4624,9 @@ class PetWindow(QWidget):
                          video.mirror, self.width(), self.height(), dpr,
                          self.bubble_text if now < self.bubble_until else "",
                          self.bubble_inner, self.bubble_font.toString(), self.cfg.get("theme"),
-                         shake_frame, video_transition_frame)
+                         shake_frame, video_transition_frame,
+                         (video._outgoing_result[2].cacheKey()
+                          if video.use_native and video._outgoing_result is not None else None))
             if cache_key == getattr(self, "_video_paint_key", None):
                 self._present_pet_frame(self._video_paint_image, None)
                 return
@@ -4537,9 +4775,40 @@ class PetWindow(QWidget):
                             min(1.0, max(0.0, (self._edge_impact_until - shake_now) / 0.25)))
                 p.translate(0.6 * math.sin(phase) * envelope,
                             0.4 * math.sin(phase * 1.31) * envelope)
-            if video_transition_alpha < 1.0:
-                p.setOpacity(video_transition_alpha)
-            p.drawImage(frame_rect, frame)
+            if self.video.use_native and video_transition_alpha < 1.0:
+                # 在预乘 alpha 图层上做加权相加：重叠的实心像素始终保持不透明。
+                body_layer = QImage(image.size(), QImage.Format.Format_ARGB32_Premultiplied)
+                body_layer.setDevicePixelRatio(dpr)
+                body_layer.fill(Qt.GlobalColor.transparent)
+                body_painter = QPainter(body_layer)
+                body_painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                body_painter.setOpacity(1.0 - video_transition_alpha)
+                if self.video._outgoing_snapshot is not None:
+                    previous, old_offset = self.video._outgoing_snapshot
+                    self._draw_canvas_snapshot(body_painter, previous, old_offset,
+                                               1.0 - video_transition_alpha)
+                elif self.video._outgoing_result is not None:
+                    outgoing, outgoing_rect = self._transition_video_frame(rect, dpr)
+                    body_painter.drawImage(outgoing_rect, outgoing)
+                # Plus 模式下全局 opacity 会在相加、截断之后插值，造成中途变淡。
+                # 先在透明图上给新帧加权，再以完整覆盖率相加。
+                incoming = QImage(frame.size(), QImage.Format.Format_ARGB32_Premultiplied)
+                incoming.fill(Qt.GlobalColor.transparent)
+                incoming_painter = QPainter(incoming)
+                incoming_painter.setOpacity(video_transition_alpha)
+                incoming_painter.drawImage(0, 0, frame)
+                incoming_painter.end()
+                body_painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
+                body_painter.setOpacity(1.0)
+                body_painter.drawImage(frame_rect, incoming)
+                body_painter.end()
+                self._video_body_image = body_layer
+                self._video_body_offset = QPoint(self._canvas_offset)
+                p.drawImage(0, 0, body_layer)
+            else:
+                if video_transition_alpha < 1.0:
+                    p.setOpacity(video_transition_alpha)
+                p.drawImage(frame_rect, frame)
             p.restore()
             self._video_paint_key = cache_key
             self._video_paint_image = image
@@ -4581,16 +4850,31 @@ class PetWindow(QWidget):
         painter.restore()
 
     def _quality_video_frame(self, rect, dpr):
-        """绘制后台已处理好的帧；显示缩放改变时暂用原帧等待下一帧。"""
+        """缩放改变时复用已清理边缘的帧，等待后台送来新尺寸。"""
         source = self.video.frame_image
-        key = (source.cacheKey(), rect.width(), rect.height(), dpr)
-        if key != getattr(self, "_quality_frame_key", None):
+        key = getattr(self, "_quality_frame_key", None)
+        if key is None or key[0] != source.cacheKey():
             return source, rect
-        x0, y0, x1, y1 = self._quality_bounds
-        crop_rect = QRectF(round((rect.x()+x0*rect.width()/source.width())*dpr)/dpr,
-                          round((rect.y()+y0*rect.height()/source.height())*dpr)/dpr,
-                          self._quality_frame.width()/dpr, self._quality_frame.height()/dpr)
-        return self._quality_frame, crop_rect
+        return self._fit_processed_video_frame(source, self._quality_frame,
+            self._quality_bounds, key[1], key[2], key[3], rect, dpr)
+
+    def _transition_video_frame(self, rect, dpr):
+        """旧片段继续提供真实运动帧，显示位置统一使用当前角色锚点。"""
+        _, _, source, old_rect, old_dpr, enhanced, bounds = self.video._outgoing_result
+        return self._fit_processed_video_frame(source, enhanced, bounds,
+            old_rect.width(), old_rect.height(), old_dpr, rect, dpr)
+
+    @staticmethod
+    def _fit_processed_video_frame(source, enhanced, bounds, old_width, old_height,
+                                   old_dpr, rect, dpr):
+        if old_width <= 0 or old_height <= 0:
+            return enhanced, rect
+        x0, y0, _, _ = bounds
+        target = QRectF(round((rect.x() + x0 * rect.width() / source.width()) * dpr) / dpr,
+                        round((rect.y() + y0 * rect.height() / source.height()) * dpr) / dpr,
+                        enhanced.width() / old_dpr * rect.width() / old_width,
+                        enhanced.height() / old_dpr * rect.height() / old_height)
+        return enhanced, target
 
     @staticmethod
     def _build_quality_frame(source, rect, dpr):
@@ -4602,8 +4886,33 @@ class PetWindow(QWidget):
         pil = PILImage.frombytes("RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()))
         size = (max(1, round(rect.width() * dpr)),
                 max(1, round(rect.height() * dpr)))
-        scaled = pil.resize(size, PILImage.Resampling.LANCZOS)
+        # 始终按完整画幅计算缩放比例和像素原点，只重采样有内容的区域。
+        # box 使用全画幅的同一像素网格，轮廓变化不会改变角色比例或位置。
+        radius = max(1, round(0.65 * dpr))
+        bounds = pil.getchannel("A").point(lambda a: 255 if a > 4 else 0).getbbox()
+        if bounds is None:
+            empty = PILImage.new("RGBA", size)
+            return QImage(empty.tobytes(), size[0], size[1], size[0]*4,
+                          QImage.Format.Format_RGBA8888).copy(), default_bounds
+        pad = radius * 2 + 6
+        sx, sy = size[0] / rgba.width(), size[1] / rgba.height()
+        work_bounds = (max(0, math.floor(bounds[0] * sx) - pad),
+                       max(0, math.floor(bounds[1] * sy) - pad),
+                       min(size[0], math.ceil(bounds[2] * sx) + pad),
+                       min(size[1], math.ceil(bounds[3] * sy) + pad))
+        box = (work_bounds[0] / sx, work_bounds[1] / sy,
+               work_bounds[2] / sx, work_bounds[3] / sy)
+        scaled = pil.resize((work_bounds[2] - work_bounds[0],
+                             work_bounds[3] - work_bounds[1]),
+                            PILImage.Resampling.LANCZOS, box=box)
         alpha = scaled.getchannel("A")
+        # 高清视频沿抠像轮廓残留一圈暗色像素。按显示像素收紧外缘，
+        # 仅处理邻近不透明本体的区域，保留独立的水花、烟雾等半透明特效。
+        opaque_nearby = alpha.point(lambda a: 255 if a >= 250 else 0).filter(
+            ImageFilter.BoxBlur(radius * 2)).point(lambda a: 255 if a > 0 else 0)
+        contracted = alpha.filter(ImageFilter.MinFilter(radius * 2 + 1))
+        alpha = PILImage.composite(contracted, alpha, opaque_nearby)
+        alpha = alpha.point(lambda a: 0 if a <= 4 else a)
         rgb = scaled.convert("RGB")
         sharpened = rgb.filter(ImageFilter.UnsharpMask(
             radius=0.55, percent=65, threshold=3))
@@ -4612,7 +4921,9 @@ class PetWindow(QWidget):
             ImageFilter.BoxBlur(2)).point(lambda a: 255 if a == 255 else 0)
         scaled = PILImage.composite(sharpened, rgb, interior).convert("RGBA")
         scaled.putalpha(alpha)
-        enhanced = QImage(scaled.tobytes(), size[0], size[1], size[0]*4,
+        full_frame = PILImage.new("RGBA", size)
+        full_frame.paste(scaled, work_bounds[:2])
+        enhanced = QImage(full_frame.tobytes(), size[0], size[1], size[0]*4,
                           QImage.Format.Format_RGBA8888).copy()
         return enhanced, default_bounds
 
@@ -4624,6 +4935,12 @@ class PetWindow(QWidget):
         output.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         output.drawImage(0, 0, image)
         output.end()
+        if sys.platform == "win32":
+            # Windows 的 layered window 已支持逐像素 alpha 和透明点击穿透。
+            # 每帧 setMask 会再次裁剪抗锯齿轮廓，并在移动/扩缩时暴露旧缓冲区。
+            # 保存命中图供原生鼠标消息使用，显示始终交给完整的透明帧。
+            self._paint_hit_image = image
+            return
         if image.cacheKey() == getattr(self, "_mask_image_key", None):
             return
         self._mask_image_key = image.cacheKey()
@@ -4684,8 +5001,11 @@ class PetWindow(QWidget):
         if self.size() != area.size() or offset != self._canvas_offset:
             body_position = self._body_pos()
             self._canvas_offset = offset
-            self.setFixedSize(area.size())
-            self._move_body(body_position)
+            # 同时改变窗口原点和尺寸，避免先 resize 后 move 显示在旧位置。
+            self.setMinimumSize(0, 0)
+            self.setMaximumSize(16777215, 16777215)
+            self.setGeometry(body_position.x() - offset.x(),
+                             body_position.y() - offset.y(), area.width(), area.height())
             self._video_paint_key = None
         return offset
 
@@ -4735,6 +5055,7 @@ class PetWindow(QWidget):
         if video is None or not video.clip:
             return True
         body_clips = (ANIM_POOLS.get("待机", []) + ANIM_POOLS.get("拖拽", []) +
+                      [ACTION_TO_CLIP.get(key) for key in CLICK_ACTIONS] +
                       [ACTION_TO_CLIP.get("bump"), ACTION_TO_CLIP.get("squash")])
         return video.clip in body_clips
 
@@ -5053,7 +5374,7 @@ class PetWindow(QWidget):
         if not self.video.ensure():
             self._video_failed = True
             return False
-        if self.video.clip != clip:
+        if self.video.clip != clip and not self.video.use_native:
             previous = getattr(self, "_video_paint_image", None)
             self._video_transition_from_image = previous.copy() if previous is not None else None
             self._video_transition_from_offset = QPoint(
@@ -5062,6 +5383,9 @@ class PetWindow(QWidget):
             self._video_fade_started = None
             self._idle_transition_from_image = None
             self._idle_fade_started = None
+        # 先确定目标动作的画布，后台首帧就会使用正确的显示尺寸。
+        self.video.clip = clip
+        self._sync_video()
         ok = self.video.play(clip, loop=loop)
         if ok:
             self.action = None
@@ -5747,6 +6071,28 @@ class PetWindow(QWidget):
             pass
 
     # ---------- 鼠标事件 ----------
+    def nativeEvent(self, event_type, message):
+        if sys.platform == "win32" and bytes(event_type) == b"windows_generic_MSG":
+            try:
+                msg = ctypes.cast(int(message), ctypes.POINTER(_MSG)).contents
+                image = getattr(self, "_paint_hit_image", None)
+                if msg.message == 0x0084 and image is not None:  # WM_NCHITTEST
+                    x = ctypes.c_short(msg.lParam & 0xffff).value
+                    y = ctypes.c_short((msg.lParam >> 16) & 0xffff).value
+                    # lParam 是物理屏幕坐标；使用原生窗口原点转换为帧像素。
+                    class NativePoint(ctypes.Structure):
+                        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+                    point = NativePoint(x, y)
+                    convert = ctypes.windll.user32.ScreenToClient
+                    convert.argtypes = [ctypes.c_void_p, ctypes.POINTER(NativePoint)]
+                    if convert(int(self.winId()), ctypes.byref(point)):
+                        if (not image.rect().contains(point.x, point.y) or
+                                image.pixelColor(point.x, point.y).alpha() <= 4):
+                            return True, -1  # HTTRANSPARENT
+            except (AttributeError, OSError, ValueError):
+                pass
+        return super().nativeEvent(event_type, message)
+
     def hideEvent(self, e):
         if self.video is not None:            # 本体藏起来（护眼/显示隐藏）时视频也藏
             self.video.stop()
@@ -5866,11 +6212,14 @@ class PetWindow(QWidget):
             self.food_panel.popup_at(self._body_pos().x() + self.win_w / 2, self._body_pos().y() + BUBBLE_H)
 
     def _on_single_click(self):
-        """单击：先 Q 弹挤压、再随机回应一个动作，同时回嘴。"""
+        """单击：视频直接衔接回应；立绘保留 Q 弹挤压与回应链。"""
         key = random.choice(CLICK_ACTIONS)
-        self.play_action("squash", force=True)
-        self._next_action = key
-        self.jump_t = 0.6
+        if self.video_ready() and self.clip_for(key):
+            self.play_action(key, force=True)
+        else:
+            self.play_action("squash", force=True)
+            self._next_action = key
+            self.jump_t = 0.6
         if random.random() < 0.6:
             self.say(random.choice(REACT_LINES))
 
