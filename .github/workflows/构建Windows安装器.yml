@@ -46,6 +46,7 @@ jobs:
           Copy-Item -Path (Join-Path $program '*') -Destination $stage -Recurse -Force
           robocopy (Join-Path $env:GITHUB_WORKSPACE 'anim') (Join-Path $stage 'anim') /E /XD 'hd' /NFL /NDL /NJH /NJS /NP
           if ($LASTEXITCODE -ge 8) { throw "标准动画复制失败，robocopy 退出码 $LASTEXITCODE" }
+          $global:LASTEXITCODE = 0
           foreach ($file in @('LICENSE', '溯源与致谢.md', 'README.md')) {
             Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE $file) -Destination $stage -Force
           }
