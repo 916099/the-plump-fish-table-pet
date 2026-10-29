@@ -1,0 +1,9 @@
+# Windows 安装器构建说明
+
+安装器脚本使用 Inno Setup 7、`wizard.bmp` 和 `wizard-small.bmp`。这两个图片使用项目的三视图立绘制作；可在 Windows 上安装 Pillow 后运行 `python installer/生成安装界面.py` 重新生成。
+
+首先使用 PyInstaller 的目录模式生成程序，确保 `sprites/` 打入内部资源目录，`imageio_ffmpeg` 可执行文件被收集；将项目的 `anim/` 复制到程序可执行文件旁，附带 LICENSE、溯源与致谢和使用说明。准备好的目录应包含 `大肥鱼桌宠.exe`、`_internal/` 和 `anim/`，不应包含个人配置、聊天记录、Key 或浏览器数据。
+
+标准版仅需复制 `anim/` 中的文件，不要把 `anim/hd/` 打入安装器。将 `FISH_INSTALL_SOURCE` 指向上述目录，将 `FISH_INSTALL_OUTPUT` 指向输出目录，然后使用 Inno Setup 编译 `installer/大肥鱼桌宠.iss`。安装器为当前用户安装，支持自选目录、可选桌面快捷方式和联网安装高清动画。高清组件的下载地址、大小及 SHA-256 写在脚本里：重新生成扩展包时必须同步更新，再重新编译。用户配置位于用户配置目录，卸载安装文件时保留。
+
+本安装器包含的角色及动画素材遵循原作者非商业使用要求，详见项目 README 与溯源说明。

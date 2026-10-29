@@ -391,6 +391,10 @@ python 桌宠.py
 
 ## 打包成独立 exe（可分享给朋友）
 
+Windows 安装器提供中文安装向导和自选安装目录。标准安装包含标准清晰度动画；如在安装选项中勾选高清动画，安装器会联网下载高清扩展包并校验文件。安装器及扩展包发布在仓库的 Releases 页面，源码构建说明见 [installer/README.md](installer/README.md)。
+
+以下命令是上游遗留的简单打包示例，不包含本项目完整的视频动画及安装向导：
+
 ```bash
 pip install pyinstaller
 pyinstaller --noconfirm --onefile --windowed --name 大肥鱼桌宠 --add-data "sprites;sprites" --icon icon.ico 桌宠.py
