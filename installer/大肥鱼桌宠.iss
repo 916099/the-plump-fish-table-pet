@@ -28,6 +28,7 @@ WizardStyle=modern
 WizardImageFile=wizard.bmp
 WizardSmallImageFile=wizard-small.bmp
 WizardImageStretch=yes
+ArchiveExtraction=enhanced/nopassword
 Compression=lzma2/fast
 SolidCompression=no
 CloseApplications=yes
