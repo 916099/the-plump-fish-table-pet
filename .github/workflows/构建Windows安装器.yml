@@ -1,0 +1,101 @@
+name: 构建 Windows 安装器
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: 检出公开源码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: 安装项目依赖
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt PyInstaller==6.22.3
+
+      - name: 检查源码隐私
+        run: python tools/check_privacy.py
+
+      - name: 构建程序目录
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'dafeiyu-build'
+          $spec = Join-Path $work 'spec'
+          $env:PYINSTALLER_CONFIG_DIR = Join-Path $work 'pyinstaller-cache'
+          $env:TEMP = Join-Path $work 'temp'
+          $env:TMP = $env:TEMP
+          New-Item -ItemType Directory -Force -Path $work, $spec, $env:TEMP | Out-Null
+          $spriteData = (Join-Path $env:GITHUB_WORKSPACE 'sprites') + ';sprites'
+          python -m PyInstaller --noconfirm --clean --onedir --windowed --name '大肥鱼桌宠' --icon (Join-Path $env:GITHUB_WORKSPACE 'icon.ico') --collect-all imageio_ffmpeg --collect-all psutil --collect-all requests --collect-all pynvml --add-data $spriteData --specpath $spec --distpath (Join-Path $work 'dist') --workpath (Join-Path $work 'pyinstaller-work') (Join-Path $env:GITHUB_WORKSPACE '桌宠.py')
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller 失败，退出码 $LASTEXITCODE" }
+          $program = Join-Path $work 'dist\大肥鱼桌宠'
+          $stage = Join-Path $work 'program-source'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Path (Join-Path $program '*') -Destination $stage -Recurse -Force
+          robocopy (Join-Path $env:GITHUB_WORKSPACE 'anim') (Join-Path $stage 'anim') /E /XD 'hd' /NFL /NDL /NJH /NJS /NP
+          if ($LASTEXITCODE -ge 8) { throw "标准动画复制失败，robocopy 退出码 $LASTEXITCODE" }
+          foreach ($file in @('LICENSE', '溯源与致谢.md', 'README.md')) {
+            Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE $file) -Destination $stage -Force
+          }
+          foreach ($forbidden in @('config.json', 'key.bin', 'avatar-chat-history.json', 'portable.txt')) {
+            if (Test-Path -LiteralPath (Join-Path $stage $forbidden)) { throw "安装源包含不应发布的文件：$forbidden" }
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $stage '大肥鱼桌宠.exe'))) { throw '缺少桌宠主程序' }
+          if (-not (Test-Path -LiteralPath (Join-Path $stage '_internal'))) { throw '缺少程序运行库目录' }
+          if (-not (Get-ChildItem -LiteralPath $stage -Filter 'ffmpeg*.exe' -Recurse -File | Select-Object -First 1)) { throw '缺少 imageio-ffmpeg 播放组件' }
+          "安装源文件数：$((Get-ChildItem -LiteralPath $stage -Recurse -File | Measure-Object).Count)"
+
+      - name: 安装并验证 Inno Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'innosetup-7.1.1-x64.exe'
+          Invoke-WebRequest -Uri 'https://files.jrsoftware.org/is/7/innosetup-7.1.1-x64.exe' -OutFile $installer
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notlike '*Pyrsys*') { throw 'Inno Setup 官方签名校验失败' }
+          $process = Start-Process -FilePath $installer -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOICONS') -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw "Inno Setup 安装失败，退出码 $($process.ExitCode)" }
+          $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }
+          $compiler = $roots | ForEach-Object { Join-Path $_ 'Inno Setup 7\ISCC.exe' } | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $compiler) { throw '未找到 Inno Setup 命令行编译器' }
+          & $compiler --version
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup 编译器自检失败' }
+          "INNO_COMPILER=$compiler" >> $env:GITHUB_ENV
+
+      - name: 编译安装器
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'dafeiyu-build'
+          $env:FISH_INSTALL_SOURCE = Join-Path $work 'program-source'
+          $env:FISH_INSTALL_OUTPUT = Join-Path $work 'installer-output'
+          New-Item -ItemType Directory -Force -Path $env:FISH_INSTALL_OUTPUT | Out-Null
+          & $env:INNO_COMPILER (Join-Path $env:GITHUB_WORKSPACE 'installer\大肥鱼桌宠.iss')
+          if ($LASTEXITCODE -ne 0) { throw "安装器编译失败，退出码 $LASTEXITCODE" }
+          $output = Join-Path $env:FISH_INSTALL_OUTPUT 'Dafeiyu-Pet-Setup-Windows-x64-v1.0.0.exe'
+          if (-not (Test-Path -LiteralPath $output)) { throw '安装器输出文件不存在' }
+          $size = (Get-Item -LiteralPath $output).Length
+          if ($size -gt 300000000) { throw "安装器超过 300 MB：$size 字节" }
+          "安装器大小：$size 字节"
+          "SHA-256：$((Get-FileHash -Algorithm SHA256 -LiteralPath $output).Hash)"
+          "SETUP_OUTPUT=$output" >> $env:GITHUB_ENV
+
+      - name: 保存待发布安装器
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dafeiyu-Pet-Setup-Windows-x64-v1.0.0
+          path: ${{ env.SETUP_OUTPUT }}
+          if-no-files-found: error
+          retention-days: 7
