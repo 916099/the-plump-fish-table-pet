@@ -207,7 +207,7 @@ pip install -r requirements.txt
 
 ### 内嵌浏览器
 
-- **地址栏什么都能吃**：网址、`D:\路径\文件.pdf`、本地 html、或者直接输搜索词；`Ctrl+L` 跳地址栏
+- **地址栏什么都能吃**：网址、本地文件路径、HTML，或者直接输搜索词；`Ctrl+L` 跳地址栏
 - **键盘能直接打进网页**：登录表单、站内搜索都能正常打字
 - **要登录的站点**：会把**网站自己的登录页**开到窗口里（扫码 / 验证码全归网站管），
   你登录完它自动重试继续干活，默认最多等 3 分钟（`login_wait_sec`）。
@@ -405,7 +405,7 @@ pyinstaller --noconfirm --onefile --windowed --name 大肥鱼桌宠 --add-data "
 
 ```bash
 pip install -r requirements.txt   # 已经装过就跳过（这一步会把 Pillow 也装上）
-set DAFEIYU_SRC=D:\你的素材目录
+set DAFEIYU_SRC=素材目录
 python tools/preprocess.py     # 白底抠图 + 统一高度
 python tools/preprocess2.py    # 边缘去污 + 预乘 alpha 缩放出各尺寸
 ```
@@ -416,14 +416,14 @@ python tools/preprocess2.py    # 边缘去污 + 预乘 alpha 缩放出各尺寸
 > 主程序的动画清晰度增强也使用 Pillow；未安装时可以运行，但会使用普通缩放。
 
 高清动画生成工具 `tools/build_hd_animations.py` 另外需要 `numpy`、`opencv-python`、`imageio-ffmpeg`。
-轻柔待机与碰撞姿态由 `python tools/build_soft_idle.py` 从原动画生成，输出原尺寸及高清版本；需要 Pillow 和 imageio-ffmpeg。原动画保留，过程检查记录写入项目旁的 `build/records/soft-idle-build`。
+轻柔待机与碰撞姿态由 `python tools/build_soft_idle.py` 从原动画生成，输出原尺寸及高清版本；需要 Pillow 和 imageio-ffmpeg。原动画保留，过程检查记录默认写入项目内的 `build/records/soft-idle/`。
 从[上游源视频包](https://github.com/PC2005-cloud/dsh-pet/releases/tag/assets-videos)提取与 `anim/` 同名的 mp4 后，可运行：
 
 ```powershell
-python tools/build_hd_animations.py --sources "源视频目录" --output anim/hd --records "..\build/records\高清生成"
+python tools/build_hd_animations.py --sources "源视频目录" --output anim/hd --records "build/records/hd"
 ```
 
-> 开源版改动：这两个脚本原来把作者的素材路径**写死**在代码里（`D:\` 盘下的私人文件夹），
+> 开源版改动：这两个脚本原来把素材路径**写死**在代码里，
 > 现在改成从环境变量 `DAFEIYU_SRC` / `DAFEIYU_OUT` 读，输出默认写到本仓库的 `sprites/`。
 > 不设环境变量直接跑会明确告诉你该怎么填，不会瞎猜路径。
 

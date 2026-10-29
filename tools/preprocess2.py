@@ -6,7 +6,7 @@
 用法（开源版：路径不再写死任何人的机器）：
   先跑 tools/preprocess.py 得到透明底三视图，再跑本脚本生成多尺寸精灵。
   指定素材目录，二选一：
-    - 推荐：set DAFEIYU_SRC=D:\\我的素材\\大肥鱼
+    - 推荐：set DAFEIYU_SRC=素材目录
     - 或者：把下面的 SRC 直接改成你的目录
   输出默认写到本仓库的 sprites/ 目录（可用 DAFEIYU_OUT 改）。
 """

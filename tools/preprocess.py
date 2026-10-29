@@ -4,7 +4,7 @@
 用法（开源版：路径不再写死任何人的机器）：
   1) 把你的三视图原图（白底）放进一个目录，里面要有 正面.png / 侧面.png / 背面.png
   2) 指定素材目录，二选一：
-       - 推荐：设环境变量   set DAFEIYU_SRC=D:\\我的素材\\大肥鱼
+       - 推荐：设环境变量   set DAFEIYU_SRC=素材目录
        - 或者：把下面的 SRC 直接改成你的目录
   3) 运行   python tools/preprocess.py
   输出默认写到本仓库的 sprites/ 目录（可用 DAFEIYU_OUT 改）。

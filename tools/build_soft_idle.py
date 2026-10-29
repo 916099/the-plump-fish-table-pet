@@ -1,8 +1,8 @@
 """生成轻柔呼吸待机与固定揉头姿态，不改动上游动画。
 
 用法：python tools/build_soft_idle.py
-需要项目运行依赖 Pillow、imageio-ffmpeg。过程日志默认写入项目旁的
-build/records/soft-idle-build；输出写入 anim 与 anim/hd。
+需要项目运行依赖 Pillow、imageio-ffmpeg。过程日志默认写入项目内的
+build/records/soft-idle；输出写入 anim 与 anim/hd。
 """
 import argparse
 import json
@@ -113,7 +113,7 @@ def verify(ffmpeg, target, size, expected_frames, source_first):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--records", type=Path,
-                        default=ROOT.parent / "build/records" / "soft-idle-build")
+                        default=ROOT / "build" / "records" / "soft-idle")
     args = parser.parse_args()
     args.records.mkdir(parents=True, exist_ok=True)
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
