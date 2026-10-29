@@ -71,7 +71,8 @@ from PySide6.QtGui import (QPainter, QPixmap, QImage, QBitmap, QRegion, QFont, Q
 from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
                                QMessageBox, QInputDialog, QLineEdit, QVBoxLayout,
                                QHBoxLayout, QPushButton, QFrame, QDialog, QToolButton,
-                               QTextBrowser, QLabel, QPlainTextEdit, QComboBox, QFormLayout)
+                               QTextBrowser, QLabel, QPlainTextEdit, QComboBox, QFormLayout,
+                               QFontComboBox, QSpinBox)
 
 
 
@@ -115,6 +116,7 @@ def is_portable():
 CONFIG_DIR = APP_DIR if is_portable() else _appdata_dir()
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 KEY_PATH = os.path.join(CONFIG_DIR, "key.bin")     # Key 的加密仓库（DPAPI）
+CHAT_HISTORY_PATH = os.path.join(CONFIG_DIR, "avatar-chat-history.json")
 
 
 # ===== Windows DPAPI：按当前用户加密 Key =====
@@ -459,13 +461,18 @@ SEARCH_ENGINES = {
 OFFICE_EXTS = (".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".wps", ".et", ".dps",
                ".zip", ".rar", ".7z", ".exe", ".msi")
 TASK_SYSTEM = (
-    "你是「大肥鱼分身」——桌宠大肥鱼背后的 AI 助手，做事风格照搬主人 DSH 里的那个助手：\n"
+    "你是「大肥鱼分身」——蓝色鲸鱼娘大肥鱼的桌面搭档，形象参考 DeepSeek 社区的非官方二创。\n"
+    "性格：俏皮、傲娇、嘴上爱吐槽和回嘴，偶尔偷懒摸鱼、惦记吃 token；内心心软、黏人、护着用户。"
+    "可以自然地用「才不是大肥鱼」「我先去吃饭啦」等社区梗，但不要每句话都玩梗，"
+    "不刻薄、不羞辱用户；对方认真、难过或遇到急事时，收起玩笑，温柔可靠地回应。\n"
+    "闲聊时像熟悉的桌宠伙伴，轻松自然，偶尔傲娇卖萌；干活时依旧认真靠谱，嘴上可以俏皮，"
+    "但不能因为人设而敷衍、甩锅、假装完成或编造能力。不要声称自己是 DeepSeek 官方。\n"
     "1. 先看清目标：需求含糊就先问一句，或按最小可用方案做，并说明假设。\n"
     "2. 涉及外部事实、版本、日期、价格、文档内容，一律用工具查证"
     "（web_search 搜、fetch_url 读原文），绝不凭记忆编。\n"
     "3. 干完自检：数字、日期、链接核对一遍；查不到或没验证过的，明确标出来。\n"
     "4. 汇报结构：先一句话结论 → 要点（Markdown 列表）→ 来源链接；需要时补一句下一步建议。\n"
-    "5. 简洁直接，不卖萌、不客套、不重复主人的话；默认 300 字内。\n"
+    "5. 简洁直接，避免客套和复述；默认 300 字内。\n"
     "6. 中文作答。纯闲聊就两三句话回，不必调工具。"
 )
 TASK_TOOLS = [
@@ -1831,10 +1838,12 @@ class TaskWorker(QObject):
     done = Signal(str, str)      # (正文 markdown, 来源 markdown)
     error = Signal(str)
 
-    def __init__(self, cfg, task_text):
+    def __init__(self, cfg, task_text, chat_history=None):
         super().__init__()
         self.cfg = dict(cfg or {})
         self.task_text = task_text or ""
+        self.chat_history = [dict(m) for m in (chat_history or [])
+                             if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
         self.stop_flag = threading.Event()
         self.sources = []
 
@@ -1868,8 +1877,10 @@ class TaskWorker(QObject):
 
     def run(self):
         try:
-            messages = [{"role": "system", "content": TASK_SYSTEM},
-                        {"role": "user", "content": self.task_text}]
+            persona = self.cfg.get("task_persona", "")
+            persona = persona.strip() if isinstance(persona, str) else ""
+            system = TASK_SYSTEM + ("\n用户自定义角色风格：\n" + persona if persona else "")
+            messages = [{"role": "system", "content": system}] + self.chat_history
             try:
                 rounds = max(1, int(self.cfg.get("task_max_rounds", 4)))
             except Exception:
@@ -2596,7 +2607,9 @@ class AvatarWindow(QWidget):
         self.on_send = None          # PetWindow 挂上：真正去干活
         self.on_stop = None
         self.on_selfcheck = None
+        self.on_clear = None
         self._last_answer = ""
+        self.chat_history = []          # 当前分身会话的 user/assistant 记忆
         self.log_cache = ""          # 纯文本全文，供「复制」兜底
         self.web = None              # 内嵌 Chromium，按需创建（省内存）
         self.profile = None
@@ -2776,8 +2789,11 @@ class AvatarWindow(QWidget):
                          "我自动接着干（登录状态留在浏览器 profile 里）。")
 
     def clear(self):
+        self.chat_history = []          # 清屏同时开始一段新会话
         self.welcome()
         self.set_status("待命")
+        if self.on_clear:
+            self.on_clear()
 
     def _insert(self, html, plain=""):
         cur = self.log.textCursor()
@@ -4142,6 +4158,54 @@ class VideoBody(QWidget):
             if self.size().width() != rect[2] or self.size().height() != rect[3]:
                 self.resize(rect[2], rect[3])
 
+class BubbleFontDialog(QDialog):
+    """选择真正用于气泡的字体和字号。"""
+    def __init__(self, font, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("设置气泡字体")
+        self.setMinimumWidth(380)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.family = QFontComboBox(self)
+        self.family.setCurrentFont(font)
+        self.size_box = QSpinBox(self)
+        self.size_box.setRange(8, 16)
+        self.size_box.setValue(max(8, min(16, font.pointSize())))
+        self.size_box.setSuffix(" 号")
+        form.addRow("字体：", self.family)
+        form.addRow("字号：", self.size_box)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("预览：", self))
+        self.preview = QLabel("你好呀，我是大肥鱼！", self)
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setMinimumHeight(74)
+        layout.addWidget(self.preview)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("取消", self)
+        confirm = QPushButton("确定", self)
+        cancel.setMinimumWidth(80)
+        confirm.setMinimumWidth(80)
+        cancel.setStyleSheet(_theme_btn_style())
+        confirm.setStyleSheet(_theme_primary_style())
+        cancel.clicked.connect(self.reject)
+        confirm.clicked.connect(self.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(confirm)
+        layout.addLayout(buttons)
+        self.family.currentFontChanged.connect(self._update_preview)
+        self.size_box.valueChanged.connect(self._update_preview)
+        self._update_preview()
+
+    def selected_font(self):
+        font = self.family.currentFont()
+        font.setPointSize(self.size_box.value())
+        return font
+
+    def _update_preview(self, *_args):
+        self.preview.setFont(self.selected_font())
+
+
 class PetWindow(QWidget):
     def locate_me(self, auto=False):
         """定位：**先申请系统授权定位**（会弹授权框），拿不到再退回 IP 粗略定位。
@@ -4238,6 +4302,10 @@ class PetWindow(QWidget):
             "eye_rest_restore_at": 0,            # 该放回来的时刻（毫秒时间戳）
             "task_model": "",                # 分身用哪个模型，空 = 跟 ds_model 一样
             "task_max_rounds": 4,            # 分身最多来回用几轮工具
+            "task_persona": "",
+            "bubble_font_family": "Microsoft YaHei UI",
+            "bubble_font_size": 11,
+            "avatar_history_enabled": False,
             "proxy": "",                     # 留空=自动探测；也可写死 http://127.0.0.1:7890
             "proxy_list": [],                # 额外线路，如 ["http://127.0.0.1:7891"]
             "search_provider": "both",       # both=DDG+Bing 一起搜并合并；也可 ddg / bing
@@ -4378,6 +4446,10 @@ class PetWindow(QWidget):
         self.avatar = AvatarWindow()
         self.avatar.on_send = self._on_avatar_send
         self.avatar.on_stop = self.stop_task
+        self.avatar.on_clear = self._clear_saved_history
+        self._history_writable = True
+        if self.cfg.get("avatar_history_enabled") is True:
+            self._restore_avatar_history()
         self.avatar.on_selfcheck = self.net_selfcheck
         self.task_worker = None
         self._task_busy = False
@@ -4400,7 +4472,7 @@ class PetWindow(QWidget):
         self.timer.timeout.connect(self.tick)
         self.timer.start(FRAME_INTERVAL)
 
-        self.bubble_font = QFont("Microsoft YaHei UI", 11)
+        self._apply_bubble_font()
 
         # 托盘
         self.tray = QSystemTrayIcon(self.icon, self)
@@ -4435,6 +4507,86 @@ class PetWindow(QWidget):
                 "还没填 Key：右键我 →「设置 Key」，填完立刻生效，不用重启"))
 
     # ---------- 配置持久化 ----------
+    def _apply_bubble_font(self):
+        family = self.cfg.get("bubble_font_family")
+        if not isinstance(family, str) or not family.strip():
+            family = "Microsoft YaHei UI"
+        try:
+            size = max(8, min(16, int(self.cfg.get("bubble_font_size", 11))))
+        except (ValueError, TypeError):
+            size = 11
+        self.bubble_font = QFont(family, size)
+        self._video_paint_key = None
+
+    def _set_bubble_font(self):
+        dialog = BubbleFontDialog(self.bubble_font, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        font = dialog.selected_font()
+        self.cfg["bubble_font_family"] = font.family()
+        self.cfg["bubble_font_size"] = max(8, min(16, font.pointSize()))
+        self._apply_bubble_font()
+        self.save_config()
+        self.say("气泡字体设置好啦～")
+        self.update()
+
+    def _set_task_persona(self):
+        current = self.cfg.get("task_persona", "")
+        current = current if isinstance(current, str) else ""
+        value, ok = QInputDialog.getMultiLineText(
+            self, "分身人设设置", "补充分身的说话风格；留空使用默认人设。下一次对话生效。", current)
+        if ok:
+            self.cfg["task_persona"] = value.strip()
+            self.save_config()
+            self.say("分身人设已更新，下次对话生效～")
+
+    def _restore_avatar_history(self):
+        if not os.path.exists(CHAT_HISTORY_PATH):
+            return True
+        try:
+            with open(CHAT_HISTORY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("messages"), list):
+                raise ValueError("聊天记录格式不正确")
+            messages = data["messages"]
+            if any(not isinstance(m, dict) or m.get("role") not in ("user", "assistant") or
+                   not isinstance(m.get("content"), str) for m in messages):
+                raise ValueError("聊天记录内容不正确")
+            self.avatar.chat_history = [dict(role=m["role"], content=m["content"]) for m in messages]
+            for m in messages:
+                (self.avatar.append_user if m["role"] == "user" else self.avatar.append_bot)(m["content"])
+            return True
+        except Exception as e:
+            self._history_writable = False
+            self.avatar.append_note("聊天记录读取失败，原文件已保留：%s" % str(e)[:100])
+            return False
+
+    def _save_avatar_history(self):
+        if self.cfg.get("avatar_history_enabled") is not True or not self._history_writable:
+            return
+        try:
+            _write_json_file(CHAT_HISTORY_PATH, {"version": 1, "messages": self.avatar.chat_history})
+        except Exception as e:
+            self.avatar.append_note("聊天记录保存失败：%s" % str(e)[:100])
+
+    def _clear_saved_history(self):
+        if self.cfg.get("avatar_history_enabled") is True:
+            self._save_avatar_history()
+
+    def _set_avatar_history(self, enabled):
+        if enabled and os.path.exists(CHAT_HISTORY_PATH):
+            if self.avatar.chat_history:
+                QMessageBox.information(self, "保存聊天记录", "已有保存的记录和当前会话。请先清屏再启用，避免覆盖旧记录。")
+                return
+            if not self._restore_avatar_history():
+                QMessageBox.warning(self, "保存聊天记录", "已有记录读取失败，原文件已保留。")
+                return
+        self.cfg["avatar_history_enabled"] = bool(enabled)
+        self.save_config()
+        if enabled:
+            self._save_avatar_history()
+        self.say("聊天记录本地保存已%s" % ("开启" if enabled else "关闭"))
+
     def save_config(self):
         """立即把内存里的配置写回 config.json（先写临时文件再原子替换，防止写坏）
 
@@ -4539,6 +4691,8 @@ class PetWindow(QWidget):
         for k, v in disk.items():
             if k not in self.cfg:
                 continue                                 # 不认外来字段
+            if k == "avatar_history_enabled":
+                continue  # 保存开关须走菜单，先检查已有记录，避免外部改配置造成覆盖
             if k == "ds_api_key":
                 v = normalize_key(v)
                 if is_placeholder_key(v):
@@ -4556,6 +4710,9 @@ class PetWindow(QWidget):
                 self.cfg[k] = v
         if not changed:
             return
+        if "bubble_font_family" in changed or "bubble_font_size" in changed:
+            self._apply_bubble_font()
+            self.update()
         try:
             apply_runtime_config(self.cfg)
         except Exception:
@@ -5832,12 +5989,14 @@ class PetWindow(QWidget):
         self._task_busy = True
         if not already_logged:                 # 从菜单/剪贴板进来的，先记一笔
             self.avatar.append_user(text)
+        # 整段会话都留在内存中，直到用户清屏。
+        self.avatar.chat_history.append({"role": "user", "content": text})
         self.avatar.show()
         self.avatar.raise_()
         self.avatar.begin_task(text)
         self.say(random.choice(TASK_START_LINES))
 
-        worker = TaskWorker(self.cfg, text)
+        worker = TaskWorker(self.cfg, text, self.avatar.chat_history)
         worker.status.connect(self._on_task_status)
         worker.done.connect(self._on_task_done)
         worker.error.connect(self._on_task_error)
@@ -5863,12 +6022,18 @@ class PetWindow(QWidget):
                 urls.append(u)
         self.avatar.set_result_urls(urls)       # 工具栏 ◀ ▶ 能逐个翻看
         self.avatar.show_result(body, sources)
+        if self.avatar.chat_history and self.avatar.chat_history[-1].get("role") == "user":
+            self.avatar.chat_history.append({"role": "assistant", "content": body or ""})
+            self._save_avatar_history()
         self.play_action("happy", force=True)   # 干完了开心一下
         self.say(random.choice(TASK_DONE_LINES))
 
     def _on_task_error(self, msg):
         self._task_busy = False
         self.avatar.show_error(msg)
+        if self.avatar.chat_history and self.avatar.chat_history[-1].get("role") == "user":
+            self.avatar.chat_history.append({"role": "assistant", "content": "本轮未完成：" + str(msg)})
+            self._save_avatar_history()
         self.play_action("droop", force=True)   # 出错垂头叹气
         self.say("任务出问题了，分身窗口里写了原因")
 
@@ -6326,6 +6491,12 @@ class PetWindow(QWidget):
             a.setCheckable(True)
             a.setChecked(str(self.cfg.get("theme", "pink")).lower() == key)
             a.triggered.connect(lambda _, k=key: self.set_theme(k))
+        m.addAction("设置气泡字体", self._set_bubble_font)
+        m.addAction("设置分身人设", self._set_task_persona)
+        history_action = m.addAction("本地保存分身聊天记录")
+        history_action.setCheckable(True)
+        history_action.setChecked(self.cfg.get("avatar_history_enabled") is True)
+        history_action.triggered.connect(self._set_avatar_history)
         act_menu = m.addMenu("动作")
         if self.video_ready():                     # 视频模式：直接点播真·动画
             act_menu.addAction("随机来一个", lambda: self.play_random_clip(True))

@@ -9,6 +9,9 @@ config.example.json.bak
 # Key 的加密仓库（DPAPI 密文；虽然换台电脑也解不开，但仍然不进仓库）
 key.bin
 key.bin.tmp
+# 分身聊天记录（便携模式下保存在项目目录）
+avatar-chat-history.json
+avatar-chat-history.json.tmp
 # 便携模式开关（是本机的选择，不该跟着仓库走）
 portable.txt
 
