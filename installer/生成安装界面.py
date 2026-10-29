@@ -24,4 +24,3 @@ d=ImageDraw.Draw(im); d.rounded_rectangle((39,814,453,885),18,outline=(112,151,2
 d.text((71,834),'透明桌宠  ·  随时陪伴',font=small,fill=(227,237,255))
 im.save(out/'wizard.bmp')
 smallim=Image.new('RGB',(165,165),(244,248,255)); sp=Image.open(root/'sprites'/'正面.png').convert('RGBA'); sp.thumbnail((135,150),Image.Resampling.LANCZOS);smallim.paste(sp,((165-sp.width)//2,(165-sp.height)//2),sp);smallim.save(out/'wizard-small.bmp')
-
